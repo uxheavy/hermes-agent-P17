@@ -344,9 +344,11 @@ def message_agent_tool(
             return relayed
         return _err("You can't message yourself. Pick a teammate from the roster.")
 
+    from tools.bot_relay import hermes_cli
+
     return _start_delivery(
         [
-            "hermes",
+            hermes_cli(),
             "-p",
             resolved,
             "chat",

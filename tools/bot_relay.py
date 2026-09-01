@@ -535,7 +535,7 @@ def waiter_command(root: Path | str, envelope: dict) -> str:
 # ── delivery command (used by the deliver RPC on the TARGET gateway) ────────
 
 
-def _hermes_cli() -> str:
+def hermes_cli() -> str:
     """Resolve the hermes CLI beside this gateway's own interpreter.
 
     The deliver RPC runs on the target gateway, whose process is the venv
@@ -561,7 +561,7 @@ def _hermes_cli() -> str:
 def local_delivery_command(profile: str, query_file: str) -> list[str]:
     """argv that delivers a DM into ``profile``'s Bot Chat on THIS gateway."""
     return [
-        _hermes_cli(),
+        hermes_cli(),
         "-p",
         profile,
         "chat",
