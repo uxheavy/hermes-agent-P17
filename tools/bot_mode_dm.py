@@ -290,6 +290,7 @@ def message_agent_tool(
 
     sender_handle = _handle(me)
     prefix = f"Message from 🤖 {sender_handle} (@{sender_handle}): "
+    from tools.bot_relay import hermes_cli
 
     # ── peer target: '<peer>/<agent>' or a bare registered peer name ──
     peer_match = _PEER_TARGET_RE.match(raw_target)
@@ -304,7 +305,7 @@ def message_agent_tool(
         dm_target = f"{peer_name}/{peer_profile}" if peer_profile else peer_name
         label = f"@{peer_profile or peer_name} on peer '{peer_name}'"
         return _start_delivery(
-            ["hermes", "peer", "dm", dm_target],
+            [hermes_cli(), "peer", "dm", dm_target],
             prefix + body,
             label,
             stdin_file=True,
@@ -343,8 +344,6 @@ def message_agent_tool(
         if relayed is not None:
             return relayed
         return _err("You can't message yourself. Pick a teammate from the roster.")
-
-    from tools.bot_relay import hermes_cli
 
     return _start_delivery(
         [
