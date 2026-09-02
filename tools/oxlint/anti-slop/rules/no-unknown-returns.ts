@@ -113,3 +113,7 @@ export const noUnknownReturnsRule = defineRule({
     };
   },
 });
+/**
+ * Copyright (c) 2026-present Ngo Quoc Huy
+ * SPDX-License-Identifier: MIT
+ */

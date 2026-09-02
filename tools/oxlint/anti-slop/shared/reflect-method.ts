@@ -33,3 +33,7 @@ export function isGlobalReflectMethodCall(
     ? property.type === "Literal" && property.value === methodName
     : property.type === "Identifier" && property.name === methodName;
 }
+/**
+ * Copyright (c) 2026-present Ngo Quoc Huy
+ * SPDX-License-Identifier: MIT
+ */
