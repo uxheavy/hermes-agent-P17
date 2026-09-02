@@ -1,0 +1,12 @@
+name: Copyright attribution
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  policy:
+    uses: uxheavy/.github/.github/workflows/copyright.yml@9f3a583af79b3cfdda24077f2a5b8dfe08390f04

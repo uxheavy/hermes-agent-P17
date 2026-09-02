@@ -1,0 +1,11 @@
+This project includes a modified version of Hermes Agent.
+
+Original Hermes Agent portions are Copyright (c) 2025 Nous Research.
+Changes authored by Ngo Quoc Huy are Copyright (c) 2026-present Ngo Quoc Huy.
+Other contributions remain attributed to their respective authors in the Git
+history.
+
+Except for separately licensed components, the combined work remains licensed
+under the MIT License in the root LICENSE. In particular,
+`plugins/security-guidance/` retains its Apache-2.0 LICENSE and NOTICE; those
+nested terms continue to apply to that component.
