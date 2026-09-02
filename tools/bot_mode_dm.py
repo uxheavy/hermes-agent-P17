@@ -258,13 +258,6 @@ def message_agent_tool(
 
     sender_handle = _handle(me)
     prefix = f"Message from 🤖 {sender_handle} (@{sender_handle}): "
-    try:
-        from tools.bot_relay import hermes_cli
-
-        hermes_executable = hermes_cli()
-    except OSError as exc:
-        return _err(f"Hermes delivery executable unavailable: {exc}")
-
     # ── peer target: '<peer>/<agent>' or a bare registered peer name ──
     peer_match = _PEER_TARGET_RE.match(raw_target)
     bare_peer = raw_target.lower() if raw_target.lower() in peers else None
@@ -275,6 +268,12 @@ def message_agent_tool(
             return _err(
                 f"No registered peer named '{peer_name}'.", roster=teammates, peers=peers
             )
+        try:
+            from tools.bot_relay import hermes_cli
+
+            hermes_executable = hermes_cli()
+        except OSError as exc:
+            return _err(f"Hermes delivery executable unavailable: {exc}")
         dm_target = f"{peer_name}/{peer_profile}" if peer_profile else peer_name
         label = f"@{peer_profile or peer_name} on peer '{peer_name}'"
         return _start_delivery(
@@ -318,6 +317,12 @@ def message_agent_tool(
             return relayed
         return _err("You can't message yourself. Pick a teammate from the roster.")
 
+    try:
+        from tools.bot_relay import hermes_cli
+
+        hermes_executable = hermes_cli()
+    except OSError as exc:
+        return _err(f"Hermes delivery executable unavailable: {exc}")
     return _start_delivery(
         local_delivery_args(resolved, cli=hermes_executable),
         prefix + body,
@@ -570,7 +575,8 @@ def _delivery_command(argv: list[str], dm_file: str, *, stdin_file: bool) -> str
     """Build an argv-safe command for the cleanup-owning background runner."""
     runner_argv = [
         sys.executable,
-        str(Path(__file__).resolve()),
+        "-m",
+        "tools.bot_mode_dm",
         "--run-delivery",
         "stdin" if stdin_file else "query-file",
         dm_file,

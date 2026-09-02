@@ -163,6 +163,28 @@ def test_unknown_target_lists_roster(tmp_path):
     assert set(result["teammates"]) == {"researcher", "coder"}
 
 
+def test_relay_target_does_not_require_hermes_cli(tmp_path, monkeypatch):
+    """Relay routing is Python-only and must work without a local CLI."""
+    home = _managed_home(tmp_path)
+    agent = _FakeAgent(home, title="Bot Chat")
+    monkeypatch.setattr(
+        bot_mode_dm,
+        "_try_relay_delivery",
+        lambda *args, **kwargs: json.dumps({"status": "sent", "to": "@remote"}),
+    )
+    monkeypatch.setattr(
+        bot_relay,
+        "hermes_cli",
+        lambda: pytest.fail("relay routing resolved the Hermes CLI"),
+    )
+
+    result = json.loads(
+        bot_mode_dm.message_agent_tool(target="remote", message="ping", agent=agent)
+    )
+
+    assert result == {"status": "sent", "to": "@remote"}
+
+
 def test_cannot_message_self(tmp_path):
     home = _managed_home(tmp_path)
     agent = _FakeAgent(home, title="Bot Chat")  # default profile
@@ -463,6 +485,9 @@ def test_real_delivery_command_round_trip(tmp_path, stdin_file):
         str(dm_file),
         stdin_file=stdin_file,
     )
+
+    parts = shlex.split(command)
+    assert parts[1:4] == ["-m", "tools.bot_mode_dm", "--run-delivery"]
 
     result = subprocess.run(shlex.split(command), check=False)
 
