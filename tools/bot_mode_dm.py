@@ -54,6 +54,17 @@ import time
 from pathlib import Path
 from typing import Any, Optional
 
+from tools.agent_delivery import local_delivery_args
+from tools.profile_roster import (
+    current_hermes_home,
+    hermes_root as _hermes_root,
+    profile_handle as _handle,
+    profile_name as _self_profile_name,
+    profile_names as _local_roster,
+    registered_peer_names,
+    resolve_profile_name as _resolve_local_name,
+)
+
 logger = logging.getLogger(__name__)
 
 MESSAGE_AGENT_TOOL_NAME = "message_agent"
@@ -172,56 +183,8 @@ def ensure_message_agent_tool(agent: Any) -> bool:
 # ── roster resolution ────────────────────────────────────────────────────────
 
 
-def _hermes_root(home: Path) -> Path:
-    if home.parent.name == "profiles":
-        return home.parent.parent
-    return home
-
-
-def _self_profile_name(home: Path) -> str:
-    if home.parent.name == "profiles":
-        return home.name
-    return "default"
-
-
-def _local_roster(root: Path) -> list[str]:
-    """Profile names on this install: default + every named profile."""
-    names = ["default"]
-    try:
-        profiles = root / "profiles"
-        if profiles.is_dir():
-            for child in sorted(profiles.iterdir()):
-                if child.is_dir():
-                    names.append(child.name)
-    except Exception:
-        pass
-    return names
-
-
 def _peers(root: Path) -> list[str]:
-    try:
-        from tools.bot_mode_probe import _peers as _probe_peers
-
-        return _probe_peers(root)
-    except Exception:
-        return []
-
-
-def _handle(name: str) -> str:
-    return "hermes" if name == "default" else name
-
-
-def _resolve_local_name(target: str, roster: list[str]) -> Optional[str]:
-    """Map a target handle to a profile name ('hermes' → 'default')."""
-    want = target.strip()
-    if not want:
-        return None
-    if want.lower() == "hermes":
-        return "default" if "default" in roster else None
-    for name in roster:
-        if name.lower() == want.lower():
-            return name
-    return None
+    return registered_peer_names(root)
 
 
 # ── the tool ─────────────────────────────────────────────────────────────────
@@ -252,6 +215,8 @@ def message_agent_tool(
     """
     # ── defense-in-depth gate: only a canonical Bot Chat may deliver ──
     home = _agent_home(agent)
+    if not home:
+        return _err("Hermes profile home unavailable; message_agent is unavailable.")
     try:
         from tools.bot_mode_probe import BOT_CHAT_TITLE, is_bot_mode_managed
 
@@ -290,7 +255,12 @@ def message_agent_tool(
 
     sender_handle = _handle(me)
     prefix = f"Message from 🤖 {sender_handle} (@{sender_handle}): "
-    from tools.bot_relay import hermes_cli
+    try:
+        from tools.bot_relay import hermes_cli
+
+        hermes_executable = hermes_cli()
+    except OSError as exc:
+        return _err(f"Hermes delivery executable unavailable: {exc}")
 
     # ── peer target: '<peer>/<agent>' or a bare registered peer name ──
     peer_match = _PEER_TARGET_RE.match(raw_target)
@@ -305,7 +275,7 @@ def message_agent_tool(
         dm_target = f"{peer_name}/{peer_profile}" if peer_profile else peer_name
         label = f"@{peer_profile or peer_name} on peer '{peer_name}'"
         return _start_delivery(
-            [hermes_cli(), "peer", "dm", dm_target],
+            [hermes_executable, "peer", "dm", dm_target],
             prefix + body,
             label,
             stdin_file=True,
@@ -346,18 +316,7 @@ def message_agent_tool(
         return _err("You can't message yourself. Pick a teammate from the roster.")
 
     return _start_delivery(
-        [
-            hermes_cli(),
-            "-p",
-            resolved,
-            "chat",
-            "--in",
-            "~",
-            "-c",
-            "Bot Chat",
-            "--create-if-missing",
-            "-Q",
-        ],
+        local_delivery_args(resolved, cli=hermes_executable),
         prefix + body,
         f"@{_handle(resolved)}",
         stdin_file=False,
@@ -544,7 +503,7 @@ def _delivery_lock(argv: list[str], *, stdin_file: bool):
         return contextlib.nullcontext()
     from tools.bot_relay import acquire_turn_lock
 
-    home = Path(os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
+    home = current_hermes_home()
     return acquire_turn_lock(_hermes_root(home), argv[2])
 
 
@@ -745,7 +704,10 @@ def _agent_home(agent: Any) -> str:
             return str(Path(db_path).parent)
     except Exception:
         pass
-    return os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")
+    try:
+        return str(current_hermes_home())
+    except Exception:
+        return ""
 
 
 def _session_title(agent: Any) -> str:

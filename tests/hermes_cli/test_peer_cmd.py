@@ -86,6 +86,16 @@ def test_dm_unknown_peer_and_missing_key(monkeypatch):
     assert peer_cmd.cmd_peer(SimpleNamespace(peer_action="dm", target="spark", message="hi", json=False)) == 1
 
 
+def test_peer_secret_fails_closed_without_profile_scope(monkeypatch):
+    """A secondary profile must never inherit the default process key."""
+    import agent.secret_scope as secret_scope
+
+    monkeypatch.setenv("HERMES_PEER_SPARK_KEY", "default-profile-key")
+    monkeypatch.setattr(secret_scope, "_MULTIPLEX_ACTIVE", True)
+    with pytest.raises(secret_scope.UnscopedSecretError):
+        peer_cmd._peer_secret("spark")
+
+
 # ── live HTTP dm flow (real loopback server, fake peer gateway) ──────────────
 
 

@@ -18,8 +18,8 @@ the Bot Mode protocol composes over it unchanged.
 Design notes:
 - No new server surface: the peer's stock api_server is the transport.
 - Peer labels/URLs live in config.yaml (``bot_peers``); the peer's
-  API_SERVER_KEY is a credential and lives in ``~/.hermes/.env`` as
-  ``HERMES_PEER_<NAME>_KEY``.
+  API_SERVER_KEY is a credential and lives in the active profile's ``.env``
+  as ``HERMES_PEER_<NAME>_KEY``.
 - Named-profile targets use the peer's ``/p/<profile>/`` multiplex mirror;
   the bare target is the peer gateway's own (launch) profile.
 """
@@ -64,16 +64,14 @@ def _save_peers(peers: dict) -> None:
 
 
 def _peer_secret(name: str) -> str:
-    """The peer's API key: profile-scoped secret store first, raw env fallback."""
+    """Resolve the peer key through Hermes' profile-aware secret contract."""
     env_name = _peer_key_env(name)
-    try:
-        from agent.secret_scope import get_secret
+    from agent.secret_scope import get_secret
 
-        return (get_secret(env_name, "") or "").strip()
-    except Exception:
-        import os
-
-        return (os.environ.get(env_name) or "").strip()
+    # ``get_secret`` owns the only valid fallback: process env is available
+    # only when multiplexing is inactive. Under multiplexing a missing scope
+    # must remain an explicit failure instead of borrowing the default profile.
+    return (get_secret(env_name, "") or "").strip()
 
 
 def _request(url: str, key: str, *, method: str = "GET", body: dict | None = None, timeout: int = LIST_TIMEOUT_S) -> dict:
@@ -201,12 +199,12 @@ def cmd_peer(args) -> int:
             from hermes_cli.config import save_env_value
 
             save_env_value(_peer_key_env(name), key)
-            print(f"Peer '{name}' saved ({url}) — key stored as {_peer_key_env(name)} in ~/.hermes/.env")
+            print(f"Peer '{name}' saved ({url}) — key stored as {_peer_key_env(name)} in the active profile .env")
         else:
             print(
                 f"Peer '{name}' saved ({url}). No key given — set the peer's API_SERVER_KEY with:\n"
                 f"  hermes peer add {name} --url {url} --key <key>\n"
-                f"  (or add {_peer_key_env(name)}=<key> to ~/.hermes/.env)"
+                f"  (or add {_peer_key_env(name)}=<key> to the active profile .env)"
             )
         return 0
 
@@ -248,7 +246,7 @@ def cmd_peer(args) -> int:
         if not key:
             print(
                 f"No API key for peer '{peer_name}'. Set it: hermes peer add {peer_name} "
-                f"--url <url> --key <key> (or add {_peer_key_env(peer_name)}=<key> to ~/.hermes/.env)",
+                f"--url <url> --key <key> (or add {_peer_key_env(peer_name)}=<key> to the active profile .env)",
                 file=sys.stderr,
             )
             return 1
@@ -304,7 +302,7 @@ def build_peer_parser(subparsers) -> None:
             "agent's canonical Bot Chat over the peer's API server and prints "
             "the reply — the cross-machine twin of 'hermes -p <bot> chat'. "
             "The peer must run the api_server platform; its API_SERVER_KEY is "
-            "stored locally as a credential in ~/.hermes/.env."
+            "stored locally as a credential in the active profile .env."
         ),
         epilog=(
             "Examples:\n"
@@ -323,7 +321,7 @@ def build_peer_parser(subparsers) -> None:
     add_p = peer_sub.add_parser("add", aliases=["set"], help="Register (or update) a peer gateway")
     add_p.add_argument("name", help="Peer name (lowercase slug, e.g. spark, homelab)")
     add_p.add_argument("--url", required=True, help="Peer gateway base URL, e.g. http://spark.lan:8377")
-    add_p.add_argument("--key", default="", help="The peer's API_SERVER_KEY (stored in ~/.hermes/.env)")
+    add_p.add_argument("--key", default="", help="The peer's API_SERVER_KEY (stored in the active profile .env)")
     add_p.add_argument("--note", default="", help="Optional description")
 
     peer_sub.add_parser("list", aliases=["ls"], help="List registered peers")

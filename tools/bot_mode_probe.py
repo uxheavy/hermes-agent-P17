@@ -33,6 +33,15 @@ import os
 import threading
 from pathlib import Path
 
+from tools.profile_roster import (
+    current_hermes_home,
+    hermes_root as _hermes_root,
+    local_profiles as _roster,
+    profile_handle as _handle,
+    profile_name as _profile_name,
+    registered_peer_names,
+)
+
 _PROTOCOL_HEADING = "## Messaging other agents"
 
 # The canonical per-bot conversation title — the only session shape that
@@ -42,19 +51,6 @@ BOT_CHAT_TITLE = "Bot Chat"
 
 _lock = threading.Lock()
 _cached: dict[str, str] = {}
-
-
-def _hermes_root(home: Path) -> Path:
-    """Root ~/.hermes for both the default profile and named profiles."""
-    if home.parent.name == "profiles":
-        return home.parent.parent
-    return home
-
-
-def _profile_name(home: Path) -> str:
-    if home.parent.name == "profiles":
-        return home.name
-    return "default"
 
 
 def _is_bot_managed(profile_dir: Path) -> bool:
@@ -78,20 +74,6 @@ def _is_bot_managed(profile_dir: Path) -> bool:
         return False
 
 
-def _roster(root: Path) -> list[tuple[str, Path]]:
-    """(name, dir) for the default profile + every named profile."""
-    entries: list[tuple[str, Path]] = [("default", root)]
-    try:
-        profiles = root / "profiles"
-        if profiles.is_dir():
-            for child in sorted(profiles.iterdir()):
-                if child.is_dir():
-                    entries.append((child.name, child))
-    except Exception:
-        pass
-    return entries
-
-
 def is_bot_mode_managed(home: str | os.PathLike | None = None) -> bool:
     """True when ANY profile on this install is Bot-Mode-managed.
 
@@ -101,9 +83,7 @@ def is_bot_mode_managed(home: str | os.PathLike | None = None) -> bool:
     section (text dedupe) but must still get the tool. Never raises.
     """
     try:
-        resolved = Path(
-            str(home) if home else (os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
-        )
+        resolved = Path(str(home)) if home else current_hermes_home()
         root = _hermes_root(resolved)
         return any(_is_bot_managed(d) for _n, d in _roster(root))
     except Exception:
@@ -116,11 +96,6 @@ def _soul_has_protocol(profile_dir: Path) -> bool:
         return soul.is_file() and _PROTOCOL_HEADING in soul.read_text(encoding="utf-8", errors="replace")
     except Exception:
         return False
-
-
-def _handle(name: str) -> str:
-    # The mention middleware aliases the default profile as @hermes.
-    return "hermes" if name == "default" else name
 
 
 def _profile_role(profile_dir: Path) -> str:
@@ -174,22 +149,7 @@ def _peers(root: Path) -> list[str]:
     Reads config.yaml directly (cheap, no config-loader import) — the section
     is optional and absent on most installs. Never raises.
     """
-    try:
-        cfg_path = root / "config.yaml"
-        if not cfg_path.is_file():
-            return []
-        raw = cfg_path.read_text(encoding="utf-8", errors="replace")
-        if "bot_peers" not in raw:
-            return []
-        import yaml
-
-        data = yaml.safe_load(raw)
-        peers = data.get("bot_peers") if isinstance(data, dict) else None
-        if not isinstance(peers, dict):
-            return []
-        return sorted(str(name) for name in peers if str(name).strip())
-    except Exception:
-        return []
+    return registered_peer_names(root)
 
 
 def _remote_paragraph(root: Path) -> str:
@@ -292,7 +252,7 @@ def get_bot_mode_protocol_section(home: str | os.PathLike | None = None, *, forc
     not the ambient HERMES_HOME — build threads can lose the ContextVar
     override and the env var would then name the wrong profile.
     """
-    resolved = str(home) if home else (os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
+    resolved = str(home) if home else str(current_hermes_home())
     with _lock:
         if force_refresh or resolved not in _cached:
             try:
@@ -332,7 +292,7 @@ def capability_fingerprint(home: str | os.PathLike | None = None) -> str:
     import hashlib
     import json
 
-    resolved = Path(str(home) if home else (os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes")))
+    resolved = Path(str(home)) if home else current_hermes_home()
     surface: dict = {}
     try:
         # Canonical loader (managed overlay + env expansion + normalization),
