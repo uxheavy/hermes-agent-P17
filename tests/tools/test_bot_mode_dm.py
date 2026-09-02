@@ -1,3 +1,6 @@
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 """Tests for tools/bot_mode_dm.py — the Bot-Chat-only ``message_agent`` tool.
 
 The containment contract is the headline here: the tool must exist ONLY in a
