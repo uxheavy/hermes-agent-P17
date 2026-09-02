@@ -1,3 +1,6 @@
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 r"""Windows-path viability and venv CLI resolution for bot relay (#93590).
 
 Two failures on a Windows desktop install talking to a remote gateway:

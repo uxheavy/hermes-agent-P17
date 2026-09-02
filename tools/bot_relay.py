@@ -1,3 +1,6 @@
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 """Bot Mode cross-connection relay — connections ARE the peer set.
 
 Every gateway connected to the user's Desktop (local, remote URL, SSH,

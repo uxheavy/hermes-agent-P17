@@ -1,3 +1,6 @@
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 """``hermes peer`` — bot-to-bot DMs across machines/gateways.
 
 A *peer* is another Hermes gateway (any machine: homelab, Spark, Hermes

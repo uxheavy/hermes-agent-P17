@@ -1,3 +1,6 @@
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 """Bot-relay JSON-RPC handlers — the gateway side of cross-connection A2A.
 
 Connections ARE the peer set: every gateway the Desktop holds a socket to

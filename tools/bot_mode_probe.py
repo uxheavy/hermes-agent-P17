@@ -1,3 +1,6 @@
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 """Bot Mode roster probe — canonical Bot Chat system prompt section.
 
 When the desktop's Bot Mode manages this install (any profile carries a

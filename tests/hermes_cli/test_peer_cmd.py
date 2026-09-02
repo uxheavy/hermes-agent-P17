@@ -1,3 +1,6 @@
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 """Tests for ``hermes peer`` — cross-machine bot-to-bot DMs."""
 
 import json

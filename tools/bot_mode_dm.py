@@ -1,3 +1,6 @@
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 """Bot Mode agent-to-agent DM tool — ``message_agent``.
 
 A structured, Bot-Chat-only tool that lets a Bot Mode agent message a

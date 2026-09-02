@@ -1,3 +1,6 @@
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 # Copyright (c) 2025 Nous Research
 # SPDX-License-Identifier: MIT
 
