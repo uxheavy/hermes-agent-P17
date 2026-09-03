@@ -1,3 +1,6 @@
+// Copyright (c) 2026-present Ngo Quoc Huy
+// SPDX-License-Identifier: MIT
+
 import { defineRule } from "@oxlint/plugins";
 
 import {

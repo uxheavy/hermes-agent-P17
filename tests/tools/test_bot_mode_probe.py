@@ -1,3 +1,6 @@
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 """Tests for tools/bot_mode_probe.py — the Bot Mode teammate-protocol section."""
 
 import textwrap
