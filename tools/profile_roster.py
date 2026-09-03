@@ -10,7 +10,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from hermes_constants import get_hermes_home
+from hermes_constants import get_hermes_home, named_profile_is_deleted
 
 
 def current_hermes_home() -> Path:
@@ -41,7 +41,7 @@ def local_profiles(root: Path) -> list[tuple[str, Path]]:
             entries.extend(
                 (child.name, child)
                 for child in sorted(profiles.iterdir())
-                if child.is_dir()
+                if child.name != ".deleted" and child.is_dir() and not named_profile_is_deleted(child)
             )
     except OSError:
         pass
