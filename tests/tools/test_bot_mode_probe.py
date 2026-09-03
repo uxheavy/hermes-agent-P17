@@ -1,3 +1,6 @@
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 """Tests for tools/bot_mode_probe.py — the Bot Mode teammate-protocol section."""
 
 import textwrap
@@ -92,6 +95,22 @@ def test_roster_lines_carry_roles(tmp_path):
     assert "`@researcher`" in section
     assert "Research Buddy" in section
     assert "Deep research and literature review" in section
+
+
+def test_roster_excludes_tombstoned_profiles(tmp_path):
+    from hermes_constants import mark_named_profile_deleted
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    _make_bot_profile(home, "live", managed=True)
+    retired = _make_bot_profile(home, "retired", managed=True)
+    mark_named_profile_deleted(retired)
+
+    section = bot_mode_probe.get_bot_mode_protocol_section(home)
+
+    assert "@live" in section
+    assert "@retired" not in section
+    assert "@.deleted" not in section
 
 
 def test_silent_when_soul_already_carries_protocol(tmp_path):

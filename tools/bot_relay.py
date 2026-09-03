@@ -1,3 +1,6 @@
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 """Bot Mode cross-connection relay — connections ARE the peer set.
 
 Every gateway connected to the user's Desktop (local, remote URL, SSH,
@@ -45,6 +48,12 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any, Iterator, Optional
+
+from tools.agent_delivery import (
+    local_delivery_command as _build_local_delivery_command,
+    resolve_hermes_cli,
+)
+from tools.profile_roster import current_hermes_home, hermes_root
 
 logger = logging.getLogger(__name__)
 
@@ -468,8 +477,7 @@ def cleanup_bot_relay_artifacts(max_age_hours: float | None = None) -> int:
     """
     del max_age_hours  # relay staleness is governed by STALE_AFTER_SECONDS
     try:
-        home = Path(os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
-        root = home.parent.parent if home.parent.name == "profiles" else home
+        root = hermes_root(current_hermes_home())
         base = relay_root(root)
         if not base.is_dir():
             return 0
@@ -545,35 +553,15 @@ def hermes_cli() -> str:
     shells) do not provide, so delivery died with ENOENT there (#93590).
     When no sibling exists (e.g. running from a source tree without an
     installed script), a ``shutil.which`` lookup runs next — it honors
-    whatever PATH the process does have — before falling back to the bare
-    name, preserving today's behavior for interactive shells.
+    whatever PATH the process does have. If neither resolves, delivery fails
+    immediately with an actionable executable error.
     """
-    exe = Path(sys.executable or "")
-    sibling = exe.parent / ("hermes.exe" if sys.platform == "win32" else "hermes")
-    if sibling.is_file():
-        return str(sibling)
-    found = shutil.which("hermes")
-    if found:
-        return found
-    return "hermes"
+    return resolve_hermes_cli(which=shutil.which)
 
 
 def local_delivery_command(profile: str, query_file: str) -> list[str]:
     """argv that delivers a DM into ``profile``'s Bot Chat on THIS gateway."""
-    return [
-        hermes_cli(),
-        "-p",
-        profile,
-        "chat",
-        "--in",
-        "~",
-        "-c",
-        "Bot Chat",
-        "--create-if-missing",
-        "-Q",
-        "--query-file",
-        query_file,
-    ]
+    return _build_local_delivery_command(profile, query_file, cli=hermes_cli())
 
 
 # ── per-profile turn lock (#93091) ───────────────────────────────────────────

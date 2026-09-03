@@ -1,3 +1,6 @@
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 """Bot-relay JSON-RPC handlers — the gateway side of cross-connection A2A.
 
 Connections ARE the peer set: every gateway the Desktop holds a socket to
@@ -24,6 +27,8 @@ rebound onto server.py's globals at install time (see method_ctx.py) and may
 reference server module globals (``_ok``, ``_err``) not imported here.
 """
 
+import os
+
 from .method_ctx import HandlerRegistry
 
 _registry = HandlerRegistry()
@@ -39,13 +44,10 @@ def _(rid, params: dict) -> dict:
     dropped, not fatal. Result: ``{count}`` (accepted rows).
     """
     try:
-        import os
-        from pathlib import Path
-
         from tools.bot_relay import write_remote_roster
+        from tools.profile_roster import current_hermes_home, hermes_root
 
-        home = Path(os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
-        root = home.parent.parent if home.parent.name == "profiles" else home
+        root = hermes_root(current_hermes_home())
         count = write_remote_roster(root, params.get("agents"))
         return _ok(rid, {"count": count})
     except Exception as e:
@@ -60,13 +62,10 @@ def _(rid, params: dict) -> dict:
     (two Desktop windows) can't double-deliver. Result: ``{envelopes}``.
     """
     try:
-        import os
-        from pathlib import Path
-
         from tools.bot_relay import claim_pending_envelopes
+        from tools.profile_roster import current_hermes_home, hermes_root
 
-        home = Path(os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
-        root = home.parent.parent if home.parent.name == "profiles" else home
+        root = hermes_root(current_hermes_home())
         return _ok(rid, {"envelopes": claim_pending_envelopes(root)})
     except Exception as e:
         return _err(rid, 5091, str(e))
@@ -83,10 +82,8 @@ def _(rid, params: dict) -> dict:
     design (the Desktop calls it from its relay worker, off any UI path;
     the RPC pool keeps it off the WS reader thread).
     """
-    import os
     import subprocess
     import tempfile
-    from pathlib import Path
 
     profile = str(params.get("profile") or "").strip()
     message = str(params.get("message") or "").strip()
@@ -95,16 +92,17 @@ def _(rid, params: dict) -> dict:
     try:
         from tools.bot_mode_dm import MESSAGE_MAX_CHARS
         from tools.bot_relay import acquire_turn_lock, local_delivery_command
+        from tools.profile_roster import (
+            current_hermes_home,
+            hermes_root,
+            local_profiles,
+        )
 
         if len(message) > MESSAGE_MAX_CHARS + 200:  # + attribution headroom
             return _err(rid, 4091, "message too long")
 
-        home = Path(os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
-        root = home.parent.parent if home.parent.name == "profiles" else home
-        known = {"default"}
-        profiles_dir = root / "profiles"
-        if profiles_dir.is_dir():
-            known.update(c.name for c in profiles_dir.iterdir() if c.is_dir())
+        root = hermes_root(current_hermes_home())
+        known = {name for name, _path in local_profiles(root)}
         resolved = "default" if profile.lower() == "hermes" else profile
         if resolved not in known:
             return _err(rid, 4092, f"no profile '{profile}' on this gateway")
@@ -189,13 +187,10 @@ def _(rid, params: dict) -> dict:
     if not envelope_id:
         return _err(rid, 4093, "id required")
     try:
-        import os
-        from pathlib import Path
-
         from tools.bot_relay import write_reply
+        from tools.profile_roster import current_hermes_home, hermes_root
 
-        home = Path(os.getenv("HERMES_HOME") or os.path.expanduser("~/.hermes"))
-        root = home.parent.parent if home.parent.name == "profiles" else home
+        root = hermes_root(current_hermes_home())
         write_reply(
             root,
             envelope_id,

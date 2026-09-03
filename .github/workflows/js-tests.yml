@@ -81,3 +81,6 @@ jobs:
       # nothing.
       - name: Run all workspace checks
         run: node .github/scripts/run-workspace-checks.mjs
+
+      - name: Check changed JavaScript for generated slop
+        run: npm run check:anti-slop

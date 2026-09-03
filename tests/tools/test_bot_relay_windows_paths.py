@@ -1,3 +1,6 @@
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 r"""Windows-path viability and venv CLI resolution for bot relay (#93590).
 
 Two failures on a Windows desktop install talking to a remote gateway:
@@ -16,7 +19,7 @@ Two failures on a Windows desktop install talking to a remote gateway:
    which service contexts (systemd units, desktop launchers, non-login
    SSH shells) do not provide, so delivery died with ENOENT. It now
    resolves the CLI next to this gateway's own interpreter (the venv
-   bin/Scripts sibling), falling back to the bare name. The #93091
+   bin/Scripts sibling), then uses a PATH hit when available. The #93091
    turn-lock recognition in bot_mode_dm matches the CLI element by
    basename so resolved absolute paths (and ``hermes.exe``) still take
    the per-profile lock.
@@ -25,6 +28,8 @@ Two failures on a Windows desktop install talking to a remote gateway:
 import ast
 import shlex
 from pathlib import Path
+
+import pytest
 
 import tools.bot_mode_dm as bot_mode_dm
 import tools.bot_relay as bot_relay
@@ -117,15 +122,14 @@ def test_local_delivery_uses_shutil_which_when_no_sibling(tmp_path, monkeypatch)
     assert argv[0] == which_hit
 
 
-def test_local_delivery_falls_back_to_bare_name(tmp_path, monkeypatch):
+def test_local_delivery_fails_when_cli_is_unavailable(tmp_path, monkeypatch):
     empty = tmp_path / "nowhere"
     empty.mkdir(parents=True)
     monkeypatch.setattr("sys.executable", str(empty / "python"))
     monkeypatch.setattr(bot_relay.shutil, "which", lambda name: None)
 
-    argv = bot_relay.local_delivery_command("ops", "query.json")
-    assert argv[0] == "hermes"
-    assert argv[1:3] == ["-p", "ops"]
+    with pytest.raises(FileNotFoundError):
+        bot_relay.local_delivery_command("ops", "query.json")
 
 
 def test_delivery_lock_recognizes_resolved_cli_paths(tmp_path, monkeypatch):
