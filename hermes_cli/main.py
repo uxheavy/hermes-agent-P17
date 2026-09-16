@@ -83,7 +83,8 @@ if _bootstrap_root not in sys.path:
     sys.path.insert(0, _bootstrap_root)
 from hermes_cli import _startup_fast  # noqa: E402
 
-# Early venv self-heal — MUST run before any third-party import below.  When
+# Early venv self-heal — MUST run before any third-party import below, after
+# the provider-free profile JSON fast path.  When
 # a prior ``hermes update`` left a recovery marker and a core package's import
 # files were wiped (#57828 — failed lazy backend refresh), the module-level
 # ``from hermes_cli.env_loader import ...`` / ``from hermes_cli.config import
@@ -96,11 +97,6 @@ from hermes_cli import _startup_fast  # noqa: E402
 # either. It is also the canonical home of the probe/repair tables reused by
 # the full recovery path below.
 from hermes_cli import _early_recovery as _early_recovery_mod
-
-try:
-    _early_recovery_mod.recover_if_needed()
-except Exception:
-    pass
 
 
 def _exit_after_oneshot(rc: object) -> None:
@@ -424,6 +420,203 @@ _ensure_project_root_on_path_fast()
 
 if _try_ultrafast_version():
     raise SystemExit(0)
+
+
+def _run_profile_skill_operation(args):
+    """Dispatch one provider-free profile skill operation."""
+    from hermes_cli.profile_skills import (
+        approve_profile_skill_pending,
+        edit_profile_skill,
+        read_profile_skill,
+        read_profile_skill_pending,
+        reject_profile_skill_pending,
+    )
+
+    action = args.skill_action
+    if action == "read":
+        return read_profile_skill(
+            args.profile_name, args.owner_id, args.skill_id, args.expected_revision
+        )
+    if action == "edit":
+        return edit_profile_skill(
+            args.profile_name,
+            args.owner_id,
+            args.skill_id,
+            args.expected_revision,
+            args.content,
+        )
+    if action == "pending":
+        return read_profile_skill_pending(args.profile_name, args.pending_id)
+    if action == "approve":
+        return approve_profile_skill_pending(
+            args.profile_name,
+            args.pending_id,
+            args.owner_id,
+            args.skill_id,
+            args.expected_revision,
+            args.content_revision,
+        )
+    if action == "reject":
+        return reject_profile_skill_pending(
+            args.profile_name,
+            args.pending_id,
+            args.owner_id,
+            args.skill_id,
+            args.expected_revision,
+        )
+    raise ValueError("unknown profile skill action")
+
+
+def _profile_skill_result_status(result: object) -> int:
+    return 5 if isinstance(result, dict) and result.get("stale") else 0
+
+
+def _early_profile_json_command(argv: list[str]) -> int | None:
+    """Serve the bridge profile projection before provider/plugin startup."""
+    import json as _json
+
+    if len(argv) == 4 and argv[:2] == ["profile", "show"] and argv[3] == "--json":
+        name = argv[2]
+        try:
+            from hermes_cli.profiles import read_profile_summary
+
+            print(
+                _json.dumps(
+                    read_profile_summary(name),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                )
+            )
+            return 0
+        except FileNotFoundError:
+            return 4
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return 1
+    if (
+        len(argv) == 7
+        and argv[:2] == ["profile", "describe"]
+        and argv[3].startswith("--text=")
+        and argv[4] == "--expected-revision"
+        and argv[6] == "--json"
+    ):
+        name = argv[2]
+        description = argv[3][len("--text=") :]
+        expected_revision = argv[5]
+        try:
+            from hermes_cli.profiles import (
+                ProfileRevisionConflict,
+                write_profile_description,
+            )
+
+            result = write_profile_description(
+                name, description, expected_revision
+            )
+            print(_json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+            return 0
+        except FileNotFoundError:
+            return 4
+        except ProfileRevisionConflict:
+            return 5
+        except ValueError:
+            return 3
+        except (OSError, RuntimeError, TypeError):
+            return 1
+    if argv[:2] == ["profile", "model"]:
+        # Reuse the lightweight profile argparse definition before provider,
+        # gateway, and plugin startup. The full CLI uses the same definition.
+        import argparse
+
+        from hermes_cli.subcommands.profile import build_profile_model_parser
+
+        class _EarlyArgumentParser(argparse.ArgumentParser):
+            def error(self, message):
+                raise ValueError(message)
+
+        parser = _EarlyArgumentParser(add_help=False)
+        subparsers = parser.add_subparsers(dest="command")
+        build_profile_model_parser(subparsers)
+        parsed = False
+        write_requested = False
+        try:
+            from hermes_cli.profiles import (
+                ProfileConfigInputError,
+                ProfileConfigMalformed,
+                ProfileConfigRevisionConflict,
+                run_profile_model,
+            )
+
+            args = parser.parse_args(argv)
+            parsed = True
+            write_requested = any(
+                value is not None
+                for value in (args.provider, args.model, args.expected_revision)
+            )
+            result = run_profile_model(
+                args.profile_name,
+                provider=args.provider,
+                model=args.model,
+                expected_revision=args.expected_revision,
+            )
+            print(_json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+            return 0
+        except SystemExit as exc:
+            return int(exc.code or 0)
+        except ValueError as exc:
+            # Parser errors and incomplete provider/model pairs are input
+            # errors; malformed config remains a distinct fail-closed path.
+            if isinstance(exc, ProfileConfigMalformed):
+                return 1
+            if isinstance(exc, ProfileConfigInputError):
+                return 3
+            return 3 if not parsed or write_requested else 1
+        except FileNotFoundError:
+            return 4
+        except ProfileConfigRevisionConflict:
+            return 5
+        except (OSError, RuntimeError, TypeError):
+            return 1
+    if argv[:2] == ["profile", "skill"]:
+        # Reuse the lightweight profile skill parser before provider, gateway,
+        # and plugin startup. The full CLI uses the same definition.
+        import argparse
+
+        from hermes_cli.subcommands.profile import build_profile_skill_parser
+
+        class _EarlyArgumentParser(argparse.ArgumentParser):
+            def error(self, message):
+                raise ValueError(message)
+
+        parser = _EarlyArgumentParser(add_help=False)
+        subparsers = parser.add_subparsers(dest="command")
+        build_profile_skill_parser(subparsers)
+        try:
+            args = parser.parse_args(argv)
+            result = _run_profile_skill_operation(args)
+            print(_json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+            return _profile_skill_result_status(result)
+        except SystemExit as exc:
+            return int(exc.code or 0)
+        except FileNotFoundError:
+            return 4
+        except Exception as exc:
+            from hermes_cli.profile_skills import ProfileSkillRevisionConflict
+
+            if isinstance(exc, ProfileSkillRevisionConflict):
+                return 5
+            if isinstance(exc, (ValueError, TypeError)):
+                return 3
+            return 1
+    return None
+
+
+_early_profile_json_result = _early_profile_json_command(sys.argv[1:])
+if _early_profile_json_result is not None:
+    raise SystemExit(_early_profile_json_result)
+
+try:
+    _early_recovery_mod.recover_if_needed()
+except Exception:
+    pass
 
 import argparse
 import hashlib
@@ -3124,6 +3317,7 @@ def _resolve_use_tui(args) -> bool:
 
 def cmd_chat(args):
     """Run interactive chat CLI."""
+    _validate_agent_startup_args(args)
     use_tui = _resolve_use_tui(args)
 
     _apply_safe_mode(args)
@@ -3399,9 +3593,6 @@ def cmd_chat(args):
             accept_hooks=getattr(args, "accept_hooks", False),
         )
 
-    # Import and run the CLI
-    from cli import main as cli_main
-
     # --query-file: read the single query from a file (or stdin via '-') so
     # callers never have to shell-quote message bodies. This is the transport
     # the Bot Mode DM protocol uses — interpolating arbitrary text into a
@@ -3433,7 +3624,9 @@ def cmd_chat(args):
         "provider": getattr(args, "provider", None),
         "reasoning": getattr(args, "reasoning", None),
         "toolsets": args.toolsets,
+        "no_tools": getattr(args, "no_tools", False),
         "skills": getattr(args, "skills", None),
+        "session_receipt_file": getattr(args, "session_receipt_file", None),
         "verbose": getattr(args, "verbose", None),
         "quiet": getattr(args, "quiet", False),
         "query": args.query,
@@ -3453,7 +3646,24 @@ def cmd_chat(args):
     kwargs = {k: v for k, v in kwargs.items() if v is not None}
 
     try:
-        cli_main(**kwargs)
+        if kwargs.get("oneshot"):
+            # A native one-shot child needs stable behavioral config and skill
+            # read bytes for its lifetime while canonical profile/home files
+            # and write paths remain live.
+            from agent.skill_utils import execution_skill_snapshot
+            from hermes_cli.config import execution_config_snapshot
+
+            with execution_config_snapshot():
+                # Importing cli builds its module-level CLI_CONFIG. Keep that
+                # launch snapshot under the same config scope as later reads.
+                from cli import main as cli_main
+
+                with execution_skill_snapshot():
+                    cli_main(**kwargs)
+        else:
+            from cli import main as cli_main
+
+            cli_main(**kwargs)
     except ValueError as e:
         print(f"Error: {e}")
         sys.exit(1)
@@ -11209,8 +11419,10 @@ def cmd_profile(args):
         all_flag = bool(getattr(args, "all_missing", False))
         auto_flag = bool(getattr(args, "auto", False))
         overwrite_flag = bool(getattr(args, "overwrite", False))
+        json_flag = bool(getattr(args, "json_output", False))
         text_value = getattr(args, "text", None)
         name = getattr(args, "profile_name", None)
+        expected_revision = getattr(args, "expected_revision", None)
 
         if all_flag and not auto_flag:
             print("profile describe: --all requires --auto", file=sys.stderr)
@@ -11230,6 +11442,43 @@ def cmd_profile(args):
                 file=sys.stderr,
             )
             sys.exit(2)
+
+        if json_flag:
+            if all_flag or auto_flag or not name or text_value is None:
+                print(
+                    "profile describe: JSON writes require a profile name and --text",
+                    file=sys.stderr,
+                )
+                sys.exit(3)
+            if expected_revision is None:
+                print(
+                    "profile describe: JSON writes require --expected-revision",
+                    file=sys.stderr,
+                )
+                sys.exit(3)
+            try:
+                from hermes_cli.profiles import (
+                    ProfileRevisionConflict,
+                    write_profile_description,
+                )
+
+                result = write_profile_description(
+                    name, text_value, expected_revision
+                )
+            except FileNotFoundError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(4)
+            except ProfileRevisionConflict:
+                print("Error: profile revision is stale", file=sys.stderr)
+                sys.exit(5)
+            except (OSError, RuntimeError, TypeError) as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            except ValueError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(3)
+            print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+            sys.exit(0)
 
         # Show current description if no operation requested.
         if name and not text_value and not auto_flag:
@@ -11301,8 +11550,90 @@ def cmd_profile(args):
             sys.exit(0 if ok_count == 1 else 1)
         sys.exit(0 if ok_count > 0 else 1)
 
+    elif action == "skill":
+        if not getattr(args, "json_output", False):
+            print("profile skill requires --json", file=sys.stderr)
+            sys.exit(3)
+        try:
+            result = _run_profile_skill_operation(args)
+        except FileNotFoundError:
+            print("Error: profile or pending skill does not exist", file=sys.stderr)
+            sys.exit(4)
+        except Exception as exc:
+            from hermes_cli.profile_skills import ProfileSkillRevisionConflict
+
+            if isinstance(exc, ProfileSkillRevisionConflict):
+                print("Error: skill target is stale", file=sys.stderr)
+                sys.exit(5)
+            if isinstance(exc, (ValueError, TypeError)):
+                print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(3)
+            print("Error: profile skill operation unavailable", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        sys.exit(_profile_skill_result_status(result))
+
+    elif action == "model":
+        name = args.profile_name
+        if not getattr(args, "json_output", False):
+            print("profile model requires --json", file=sys.stderr)
+            sys.exit(3)
+        provider = getattr(args, "provider", None)
+        model = getattr(args, "model", None)
+        expected_revision = getattr(args, "expected_revision", None)
+        write_requested = any(
+            value is not None for value in (provider, model, expected_revision)
+        )
+        try:
+            from hermes_cli.profiles import (
+                ProfileConfigInputError,
+                ProfileConfigMalformed,
+                ProfileConfigRevisionConflict,
+                run_profile_model,
+            )
+
+            result = run_profile_model(
+                name,
+                provider=provider,
+                model=model,
+                expected_revision=expected_revision,
+            )
+        except FileNotFoundError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(4)
+        except ProfileConfigRevisionConflict:
+            print("Error: profile config revision is stale", file=sys.stderr)
+            sys.exit(5)
+        except ProfileConfigMalformed as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        except ProfileConfigInputError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(3)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(3 if write_requested else 1)
+        except (OSError, RuntimeError, TypeError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            sys.exit(1)
+        print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+        sys.exit(0)
+
     elif action == "show":
         name = args.profile_name
+        if getattr(args, "json_output", False):
+            from hermes_cli.profiles import read_profile_summary
+
+            try:
+                result = read_profile_summary(name)
+            except FileNotFoundError as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(4)
+            except (OSError, RuntimeError, TypeError, ValueError) as exc:
+                print(f"Error: {exc}", file=sys.stderr)
+                sys.exit(1)
+            print(json.dumps(result, ensure_ascii=False, separators=(",", ":")))
+            sys.exit(0)
         from hermes_cli.profiles import (
             get_profile_dir,
             profile_exists,
@@ -12496,8 +12827,16 @@ def _should_background_mcp_startup(args) -> bool:
     return args.command in {None, "chat", "rl"}
 
 
+def _validate_agent_startup_args(args) -> None:
+    """Reject incompatible chat capability switches before startup hooks."""
+    if getattr(args, "no_tools", False) and getattr(args, "toolsets", None) is not None:
+        print("Error: --no-tools cannot be combined with --toolsets", file=sys.stderr)
+        raise SystemExit(2)
+
+
 def _prepare_agent_startup(args) -> None:
     """Discover plugins/MCP/hooks for commands that can run an agent turn."""
+    _validate_agent_startup_args(args)
     # --yolo: chokepoint guarantee that HERMES_YOLO_MODE is set before ANY
     # plugin/tool discovery below imports tools.approval, which freezes
     # _YOLO_MODE_FROZEN at import time (PR #7994 security design).  main()'s
@@ -12508,6 +12847,13 @@ def _prepare_agent_startup(args) -> None:
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
     _apply_safe_mode(args)
+
+    # A caller can request a model response without granting the session any
+    # tool surface. Do this before plugin, MCP, or hook discovery below:
+    # discovery itself can import extensions or start external MCP processes
+    # even when the final tool snapshot is empty.
+    if getattr(args, "no_tools", False):
+        return
 
     _sub_attr, _sub_set = _AGENT_SUBCOMMANDS.get(args.command, (None, None))
     if not (
@@ -12605,6 +12951,7 @@ def _set_chat_arg_defaults(args) -> None:
         ("model", None),
         ("provider", None),
         ("toolsets", None),
+        ("no_tools", False),
         ("verbose", False),
         ("resume", None),
         ("continue_last", None),

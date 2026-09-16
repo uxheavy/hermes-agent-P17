@@ -9,6 +9,98 @@ from __future__ import annotations
 from typing import Callable
 
 
+def _add_profile_model_parser(profile_subparsers) -> None:
+    """Attach the bounded provider-free profile model parser."""
+    profile_model = profile_subparsers.add_parser(
+        "model", help="Read or set a profile's model assignment"
+    )
+    profile_model.add_argument("profile_name", help="Profile to inspect or update")
+    profile_model.add_argument(
+        "--provider", default=None, help="Provider name for an atomic model update"
+    )
+    profile_model.add_argument(
+        "--model", default=None, help="Model name for an atomic model update"
+    )
+    profile_model.add_argument(
+        "--expected-revision",
+        default=None,
+        help="Expected config-byte revision for an atomic model update",
+    )
+    profile_model.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        required=True,
+        help="Emit the provider-free model response as JSON",
+    )
+
+
+def build_profile_model_parser(subparsers) -> None:
+    """Build only the profile model parser for the pre-startup fast path."""
+    profile_parser = subparsers.add_parser("profile")
+    profile_subparsers = profile_parser.add_subparsers(dest="profile_action")
+    _add_profile_model_parser(profile_subparsers)
+
+
+def _add_profile_skill_parser(profile_subparsers) -> None:
+    """Attach the provider-free exact-target skill operations."""
+    profile_skill = profile_subparsers.add_parser(
+        "skill", help="Read or update one exact external skill target"
+    )
+    skill_subparsers = profile_skill.add_subparsers(
+        dest="skill_action", required=True
+    )
+
+    skill_read = skill_subparsers.add_parser("read", help="Read full skill content")
+    skill_read.add_argument("profile_name", help="Profile owning the skill scope")
+    skill_read.add_argument("--owner-id", required=True)
+    skill_read.add_argument("--skill-id", required=True)
+    skill_read.add_argument("--expected-revision", default=None)
+    skill_read.add_argument("--json", dest="json_output", action="store_true", required=True)
+
+    skill_edit = skill_subparsers.add_parser(
+        "edit", help="Replace one exact skill through the native approval path"
+    )
+    skill_edit.add_argument("profile_name", help="Profile owning the skill scope")
+    skill_edit.add_argument("--owner-id", required=True)
+    skill_edit.add_argument("--skill-id", required=True)
+    skill_edit.add_argument("--expected-revision", required=True)
+    skill_edit.add_argument("--content", required=True)
+    skill_edit.add_argument("--json", dest="json_output", action="store_true", required=True)
+
+    skill_pending = skill_subparsers.add_parser(
+        "pending", help="List or review native target-bound skill writes"
+    )
+    skill_pending.add_argument("profile_name", help="Profile owning the pending scope")
+    skill_pending.add_argument("--pending-id", default=None)
+    skill_pending.add_argument("--json", dest="json_output", action="store_true", required=True)
+
+    for action, help_text in (
+        ("approve", "Approve and replay one exact pending target"),
+        ("reject", "Reject one exact pending target"),
+    ):
+        command = skill_subparsers.add_parser(action, help=help_text)
+        command.add_argument("profile_name", help="Profile owning the pending scope")
+        command.add_argument("--pending-id", required=True)
+        command.add_argument("--owner-id", required=True)
+        command.add_argument("--skill-id", required=True)
+        command.add_argument("--expected-revision", required=True)
+        if action == "approve":
+            command.add_argument(
+                "--content-revision",
+                required=True,
+                help="SHA256 of the reviewed pending content bytes",
+            )
+        command.add_argument("--json", dest="json_output", action="store_true", required=True)
+
+
+def build_profile_skill_parser(subparsers) -> None:
+    """Build only the profile skill parser for the pre-startup fast path."""
+    profile_parser = subparsers.add_parser("profile")
+    profile_subparsers = profile_parser.add_subparsers(dest="profile_action")
+    _add_profile_skill_parser(profile_subparsers)
+
+
 def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
     """Attach the ``profile`` subcommand to ``subparsers``."""
     # =========================================================================
@@ -102,9 +194,29 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
         action="store_true",
         help="With --auto, run on every profile missing a description",
     )
+    profile_describe.add_argument(
+        "--expected-revision",
+        default=None,
+        help="Expected profile.yaml revision for an atomic JSON description write",
+    )
+    profile_describe.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="Emit the bridge profile response as JSON",
+    )
 
     profile_show = profile_subparsers.add_parser("show", help="Show profile details")
     profile_show.add_argument("profile_name", help="Profile to show")
+    profile_show.add_argument(
+        "--json",
+        dest="json_output",
+        action="store_true",
+        help="Emit the bridge profile projection as JSON",
+    )
+
+    _add_profile_model_parser(profile_subparsers)
+    _add_profile_skill_parser(profile_subparsers)
 
     profile_alias = profile_subparsers.add_parser(
         "alias", help="Manage wrapper scripts"

@@ -19,6 +19,8 @@ Usage::
     hermes profile delete coder          # remove profile + alias + service
 """
 
+import hashlib
+from io import StringIO
 import json
 import logging
 import os
@@ -29,11 +31,16 @@ import stat
 import subprocess
 import sys
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from agent.skill_utils import is_excluded_skill_path
+from agent.skill_utils import (
+    _normalize_skill_description,
+    is_excluded_skill_path,
+    yaml_load,
+)
 from hermes_cli.archive_safe import (
     archive_root_dirs,
     make_targz,
@@ -50,6 +57,20 @@ logger = logging.getLogger(__name__)
 
 _PROFILE_ID_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
 _WARNED_MISSING_ALLOWLIST_ENTRIES: set[tuple[str, ...]] = set()
+
+_PROFILE_INSTRUCTIONS_MAX_UTF8_BYTES = 8192
+_PROFILE_METADATA_MAX_BYTES = 64 * 1024
+_PROFILE_CONFIG_MAX_BYTES = 1024 * 1024
+_PROFILE_SKILLS_MAX_ITEMS = 100
+_PROFILE_SKILLS_MAX_SERIALIZED_UTF8_BYTES = 16384
+_PROFILE_SKILL_METADATA_READ_CHARS = 4096
+_PROFILE_SKILL_NAME_MAX_CHARS = 64
+_PROFILE_SKILL_DESCRIPTION_MAX_CHARS = 1024
+_PROFILE_SKILL_CATEGORY_MAX_CHARS = 1024
+_PROFILE_DESCRIPTION_MAX_UTF8_BYTES = 8192
+_PROFILE_SKILL_CONTENT_MAX_BYTES = 48 * 1024
+_PROFILE_SKILL_REVIEW_MAX_BYTES = 48 * 1024
+_PROFILE_SKILL_SUMMARY_MAX_BYTES = 64 * 1024
 
 # Directories bootstrapped inside every new profile
 _PROFILE_DIRS = [
@@ -750,23 +771,22 @@ def _read_distribution_meta(profile_dir: Path) -> tuple:
         return None, None, None
 
 
-def _read_config_model(profile_dir: Path) -> tuple:
-    """Read model/provider from a profile's config.yaml. Returns (model, provider)."""
-    config_path = profile_dir / "config.yaml"
-    if not config_path.exists():
-        return None, None
+def _read_config_model(profile_dir: Path, *, strict: bool = False) -> tuple:
+    """Read model/provider without importing the provider-bearing config stack."""
     try:
-        # Multi-profile display read: load_config() targets the ACTIVE
-        # profile's home, so read THIS profile's file via the raw primitive.
-        from hermes_cli.config import read_user_config_raw
-        cfg = read_user_config_raw(config_path)
-        model_cfg = cfg.get("model", {})
-        if isinstance(model_cfg, str):
-            return model_cfg, None
-        if isinstance(model_cfg, dict):
-            return model_cfg.get("default") or model_cfg.get("model"), model_cfg.get("provider")
+        cfg, _raw, _revision = _read_profile_config_snapshot(
+            profile_dir, strict=strict
+        )
+        return _model_values_from_config(cfg)
+    except ProfileConfigMalformed:
+        if strict:
+            raise
         return None, None
-    except Exception:
+    except Exception as error:
+        if strict:
+            raise ProfileConfigMalformed(
+                f"profile config is unreadable: {profile_dir / 'config.yaml'}"
+            ) from error
         return None, None
 
 
@@ -921,26 +941,20 @@ def _profile_yaml_path(profile_dir: Path) -> Path:
     return profile_dir / "profile.yaml"
 
 
-def read_profile_meta(profile_dir: Path) -> dict:
-    """Read ``<profile_dir>/profile.yaml`` and return a dict.
+def _read_bounded_bytes(path: Path, limit: int, *, label: str) -> bytes:
+    """Read at most ``limit`` bytes and reject an oversized file."""
+    with path.open("rb") as handle:
+        raw = handle.read(limit + 1)
+    if len(raw) > limit:
+        raise ValueError(f"{label} is too large")
+    return raw
 
-    Returns ``{"description": "", "description_auto": False,
-    "display_name": ""}`` when the file is missing or unreadable. Never
-    raises — a corrupt profile.yaml on an unrelated profile must not
-    break ``hermes profile list``.
-    """
-    empty = {"description": "", "description_auto": False, "display_name": ""}
-    path = _profile_yaml_path(profile_dir)
-    if not path.is_file():
-        return empty
-    try:
-        import yaml
-        with open(path, "r", encoding="utf-8") as f:
-            data = yaml.safe_load(f) or {}
-    except Exception:
-        return empty
-    if not isinstance(data, dict):
-        return empty
+
+def _empty_profile_meta() -> dict:
+    return {"description": "", "description_auto": False, "display_name": ""}
+
+
+def _normalize_profile_meta(data: dict) -> dict:
     return {
         "description": str(data.get("description") or "").strip(),
         "description_auto": bool(data.get("description_auto", False)),
@@ -948,7 +962,534 @@ def read_profile_meta(profile_dir: Path) -> dict:
     }
 
 
-def write_profile_meta(
+def _read_profile_metadata_snapshot(
+    profile_dir: Path, *, strict: bool = False
+) -> tuple[dict, bytes, str]:
+    """Read profile metadata once and derive its revision from those bytes."""
+    path = _profile_yaml_path(profile_dir)
+    if not path.exists():
+        if strict and path.is_symlink():
+            raise ValueError(f"profile metadata is not a file: {path}")
+        raw = b""
+        return _empty_profile_meta(), raw, hashlib.sha256(raw).hexdigest()
+    if not path.is_file():
+        if strict:
+            raise ValueError(f"profile metadata is not a file: {path}")
+        raw = b""
+        return _empty_profile_meta(), raw, hashlib.sha256(raw).hexdigest()
+    try:
+        raw = _read_bounded_bytes(
+            path, _PROFILE_METADATA_MAX_BYTES, label="profile metadata"
+        )
+        data = yaml_load(raw.decode("utf-8"))
+        if data is None or not isinstance(data, dict):
+            raise ValueError("profile metadata must be a mapping")
+    except Exception as error:
+        if strict:
+            raise ValueError(f"profile metadata is unreadable: {path}") from error
+        raw = b""
+        return _empty_profile_meta(), raw, hashlib.sha256(raw).hexdigest()
+    return _normalize_profile_meta(data), raw, hashlib.sha256(raw).hexdigest()
+
+
+@contextmanager
+def profile_metadata_lock(profile_dir: Path):
+    """Serialize every profile.yaml read-modify-write across processes."""
+    # active_sessions already owns the portable stdlib file-lock primitive.
+    # Import lazily so profile listing and provider-free reads do not create or
+    # acquire a lock, and so the profile projection stays provider-free.
+    from hermes_cli.active_sessions import _FileLock
+
+    metadata_path = _profile_yaml_path(profile_dir)
+    if os.path.islink(str(metadata_path)):
+        metadata_path = Path(os.path.realpath(str(metadata_path)))
+    lock_path = metadata_path.with_name(f".{metadata_path.name}.lock")
+    with _FileLock(lock_path):
+        yield
+
+
+def read_profile_meta(profile_dir: Path, *, strict: bool = False) -> dict:
+    """Read ``<profile_dir>/profile.yaml`` and return a dict.
+
+    Returns ``{"description": "", "description_auto": False,
+    "display_name": ""}`` when the file is missing or unreadable. Never
+    raises — a corrupt profile.yaml on an unrelated profile must not
+    break ``hermes profile list``. ``strict=True`` is used by the
+    bridge-facing summary and surfaces malformed metadata instead of silently
+    replacing it with defaults.
+    """
+    return _read_profile_metadata_snapshot(profile_dir, strict=strict)[0]
+
+
+class ProfileRevisionConflict(RuntimeError):
+    """Raised when a description write uses a stale profile revision."""
+
+
+class ProfileConfigMalformed(ValueError):
+    """Raised when a profile config cannot be safely read or written."""
+
+
+class ProfileConfigInputError(ValueError):
+    """Raised for an invalid profile model CLI write request."""
+
+
+class ProfileConfigRevisionConflict(ProfileRevisionConflict):
+    """Raised when a model write uses a stale config revision."""
+
+
+def _model_values_from_config(config: dict) -> tuple[Optional[str], Optional[str]]:
+    """Return the persisted model assignment without provider resolution."""
+    model_cfg = config.get("model", {})
+    if isinstance(model_cfg, str):
+        return model_cfg.strip() or None, None
+    if model_cfg is None:
+        return None, None
+    if not isinstance(model_cfg, dict):
+        raise ProfileConfigMalformed("profile model must be a string or mapping")
+    model = model_cfg.get("default")
+    if model is None:
+        model = model_cfg.get("model")
+    provider = model_cfg.get("provider")
+    if model is not None and not isinstance(model, str):
+        raise ProfileConfigMalformed("profile model must be a string")
+    if provider is not None and not isinstance(provider, str):
+        raise ProfileConfigMalformed("profile provider must be a string")
+    return (
+        model.strip() if isinstance(model, str) and model.strip() else None,
+        provider.strip() if isinstance(provider, str) and provider.strip() else None,
+    )
+
+
+def _read_profile_config_snapshot(
+    profile_dir: Path, *, strict: bool = False
+) -> tuple[dict, bytes, str]:
+    """Read config bytes once and derive the revision from those exact bytes."""
+    path = profile_dir / "config.yaml"
+    if path.is_symlink():
+        if strict:
+            raise ProfileConfigMalformed(f"profile config is not a file: {path}")
+        return {}, b"", hashlib.sha256(b"").hexdigest()
+    if not path.exists():
+        raw = b""
+        return {}, raw, hashlib.sha256(raw).hexdigest()
+    if not path.is_file():
+        if strict:
+            raise ProfileConfigMalformed(f"profile config is not a file: {path}")
+        return {}, b"", hashlib.sha256(b"").hexdigest()
+    try:
+        raw = _read_bounded_bytes(
+            path, _PROFILE_CONFIG_MAX_BYTES, label="profile config"
+        )
+        config = yaml_load(raw.decode("utf-8"))
+        if config is None:
+            config = {}
+        if not isinstance(config, dict):
+            raise TypeError("top-level YAML must be a mapping")
+    except Exception as error:
+        if strict:
+            raise ProfileConfigMalformed(
+                f"profile config is unreadable: {path}"
+            ) from error
+        return {}, b"", hashlib.sha256(b"").hexdigest()
+    return config, raw, hashlib.sha256(raw).hexdigest()
+
+
+@contextmanager
+def profile_config_lock(profile_dir: Path):
+    """Coordinate model reads and writes among callers that use this lock.
+
+    This is deliberately cooperative: existing gateway, ``config set``, and
+    manual writers do not acquire it, so it is not a global config lock.
+    """
+    from hermes_cli.active_sessions import _FileLock
+
+    config_path = profile_dir / "config.yaml"
+    if config_path.is_symlink():
+        config_path = Path(os.path.realpath(str(config_path)))
+    lock_path = config_path.with_name(f".{config_path.name}.lock")
+    with _FileLock(lock_path):
+        yield
+
+
+def apply_model_assignment(
+    model_cfg: "Any",
+    provider: str,
+    model: str,
+    base_url: str = "",
+    api_key: str = "",
+) -> dict:
+    """Apply one model assignment while preserving endpoint semantics."""
+    if not isinstance(model_cfg, dict):
+        model_cfg = {}
+    prev_provider = str(model_cfg.get("provider") or "").strip().lower()
+    new_provider = provider.strip().lower()
+    model_cfg["provider"] = provider
+    model_cfg["default"] = model
+    if base_url.strip():
+        model_cfg["base_url"] = base_url.strip()
+    elif model_cfg.get("base_url") and new_provider != prev_provider:
+        model_cfg["base_url"] = ""
+    if api_key.strip():
+        model_cfg["api_key"] = api_key.strip()
+        model_cfg.pop("api", None)
+    if new_provider != prev_provider:
+        from hermes_cli.config import clear_model_endpoint_credentials
+
+        if not api_key.strip() and (
+            model_cfg.get("api_key") or model_cfg.get("api")
+        ):
+            clear_model_endpoint_credentials(model_cfg, clear_api_mode=False)
+
+        clear_model_endpoint_credentials(model_cfg, clear_api_key=False)
+    model_cfg.pop("context_length", None)
+    return model_cfg
+
+
+def read_profile_model(name: str) -> dict:
+    """Read a provider-free model assignment and its config-byte revision."""
+    canon = normalize_profile_name(name)
+    validate_profile_name(canon)
+    profile_dir = get_profile_dir(canon)
+    if not profile_dir.is_dir() or (
+        canon != "default" and named_profile_is_deleted(profile_dir)
+    ):
+        raise FileNotFoundError(f"profile does not exist: {name}")
+    config, _raw, revision = _read_profile_config_snapshot(
+        profile_dir, strict=True
+    )
+    model, provider = _model_values_from_config(config)
+    return {"provider": provider, "model": model, "revision": revision}
+
+
+def _ensure_profile_model_writable() -> None:
+    """Reject global or model-scoped managed policy before a pair write."""
+    from hermes_cli import config as config_module
+    from hermes_cli import managed_scope
+
+    if config_module.is_managed():
+        raise PermissionError("configuration is managed and cannot be changed")
+    managed_keys = managed_scope.managed_config_keys()
+    if any(key == "model" or key.startswith("model.") for key in managed_keys):
+        raise PermissionError("model configuration is managed and cannot be changed")
+
+
+def write_profile_model(
+    name: str, provider: str, model: str, expected_revision: str
+) -> dict:
+    """CAS-update provider and model in one canonical config write."""
+    if (
+        not isinstance(provider, str)
+        or not provider.strip()
+        or "\x00" in provider
+    ):
+        raise ProfileConfigInputError("provider is required")
+    if not isinstance(model, str) or not model.strip() or "\x00" in model:
+        raise ProfileConfigInputError("model is required")
+    if not isinstance(expected_revision, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", expected_revision
+    ):
+        raise ProfileConfigInputError("profile config revision is invalid")
+
+    canon = normalize_profile_name(name)
+    validate_profile_name(canon)
+    profile_dir = get_profile_dir(canon)
+    if not profile_dir.is_dir() or (
+        canon != "default" and named_profile_is_deleted(profile_dir)
+    ):
+        raise FileNotFoundError(f"profile does not exist: {name}")
+    if (profile_dir / "config.yaml").is_symlink():
+        raise ProfileConfigMalformed(
+            f"profile config is not a file: {profile_dir / 'config.yaml'}"
+        )
+
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    with profile_config_lock(profile_dir):
+        config, _raw, revision = _read_profile_config_snapshot(
+            profile_dir, strict=True
+        )
+        if revision != expected_revision:
+            raise ProfileConfigRevisionConflict("profile config revision is stale")
+        token = set_hermes_home_override(str(profile_dir))
+        try:
+            _ensure_profile_model_writable()
+            config["model"] = apply_model_assignment(
+                config.get("model", {}), provider.strip().lower(), model.strip()
+            )
+            from hermes_cli.config import save_config
+
+            save_config(config)
+        finally:
+            reset_hermes_home_override(token)
+
+        updated_config, _updated_raw, updated_revision = _read_profile_config_snapshot(
+            profile_dir, strict=True
+        )
+        updated_model, updated_provider = _model_values_from_config(updated_config)
+    return {
+        "provider": updated_provider,
+        "model": updated_model,
+        "revision": updated_revision,
+    }
+
+
+def run_profile_model(
+    name: str,
+    *,
+    provider: Optional[str] = None,
+    model: Optional[str] = None,
+    expected_revision: Optional[str] = None,
+) -> dict:
+    """Run the read or complete provider/model/revision write operation."""
+    supplied = (provider is not None, model is not None, expected_revision is not None)
+    if not any(supplied):
+        return read_profile_model(name)
+    if not all(supplied):
+        raise ProfileConfigInputError(
+            "provider, model, and expected revision are required together"
+        )
+    return write_profile_model(name, provider, model, expected_revision)
+
+
+def _read_profile_instructions(profile_dir: Path) -> dict:
+    """Read a bounded UTF-8 prefix of the profile's SOUL instructions."""
+    path = profile_dir / "SOUL.md"
+    if not path.exists() and not path.is_symlink():
+        return {"exists": False, "content": "", "truncated": False}
+    if not path.is_file():
+        raise ValueError(f"profile instructions are not a file: {path}")
+    with path.open("rb") as handle:
+        raw = handle.read(_PROFILE_INSTRUCTIONS_MAX_UTF8_BYTES + 4)
+    truncated = len(raw) > _PROFILE_INSTRUCTIONS_MAX_UTF8_BYTES
+    prefix = raw[:_PROFILE_INSTRUCTIONS_MAX_UTF8_BYTES]
+    try:
+        content = prefix.decode("utf-8")
+    except UnicodeDecodeError as error:
+        # A bounded prefix may end in the middle of one UTF-8 code point. A
+        # malformed sequence before the boundary remains an error.
+        if (
+            not truncated
+            or error.reason != "unexpected end of data"
+            or error.end != len(prefix)
+        ):
+            raise ValueError(
+                f"profile instructions are not valid UTF-8: {path}"
+            ) from error
+        content = prefix[: error.start].decode("utf-8")
+    return {"exists": True, "content": content, "truncated": truncated}
+
+
+def _profile_skill_category(skill_path: Path, skills_root: Path) -> Optional[str]:
+    """Return the configured category component for one skill path."""
+    try:
+        parts = skill_path.relative_to(skills_root).parts
+    except ValueError:
+        return None
+    if parts and parts[0] == "_org":
+        parts = parts[2:]
+    if len(parts) < 3:
+        return None
+    return parts[0][:_PROFILE_SKILL_CATEGORY_MAX_CHARS] or None
+
+
+def _profile_skill_metadata(
+    skill_path: Path, skills_root: Path, frontmatter: dict
+) -> Optional[dict]:
+    """Project one discovered skill into the bounded bridge metadata shape."""
+    name = str(frontmatter.get("name") or skill_path.parent.name).strip()
+    if not name:
+        return None
+    description = _normalize_skill_description(frontmatter)
+    return {
+        "name": name[:_PROFILE_SKILL_NAME_MAX_CHARS],
+        "description": description[:_PROFILE_SKILL_DESCRIPTION_MAX_CHARS],
+        "category": _profile_skill_category(skill_path, skills_root),
+    }
+
+
+def _profile_skill_item_identity(
+    skill_path: Path, skills_root: Path, *, project: bool
+) -> str:
+    """Return an opaque identity for a read-only inventory item."""
+    relative = skill_path.resolve().relative_to(skills_root.resolve()).as_posix()
+    tier = "project" if project else "local"
+    return hashlib.sha256(
+        f"hermes-profile-skill:{tier}:{skills_root.resolve()}:{relative}".encode(
+            "utf-8"
+        )
+    ).hexdigest()
+
+
+def _profile_skill_target_fields(
+    skill_path: Path,
+    skills_root: Path,
+    raw: bytes,
+    *,
+    project: bool,
+) -> dict:
+    """Return the stable identity fields for one indexed skill."""
+    from agent.skill_utils import is_org_mirror_path
+    from tools.skill_targets import _skill_root_owner_id
+
+    root = skills_root.resolve()
+    relative = skill_path.resolve().relative_to(root)
+    skill_id = relative.parent.as_posix()
+    local_root = Path(_get_current_profile_skills_root()).resolve()
+    is_external = not project and root != local_root and not is_org_mirror_path(
+        skill_path, local_root
+    )
+    revision = hashlib.sha256(raw).hexdigest()
+    if is_external:
+        return {
+            "editable": True,
+            "owner_id": _skill_root_owner_id(root),
+            "skill_id": skill_id,
+            "revision": revision,
+        }
+    return {
+        "editable": False,
+        "item_id": _profile_skill_item_identity(
+            skill_path, root, project=project
+        ),
+    }
+
+
+def _get_current_profile_skills_root() -> Path:
+    """Resolve the profile-local skills root without importing provider code."""
+    from hermes_constants import get_hermes_home
+
+    return get_hermes_home() / "skills"
+
+
+def _read_profile_skills(profile_dir: Path) -> dict:
+    """Read bounded metadata from local and configured external skill roots."""
+    from agent.skill_utils import (
+        get_all_skills_dirs,
+        get_disabled_skill_names,
+        iter_skill_index_files,
+        parse_frontmatter,
+    )
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    token = set_hermes_home_override(profile_dir)
+    try:
+        disabled = get_disabled_skill_names()
+        items: list[dict] = []
+        seen_identities: set[tuple[str, str]] = set()
+        for skills_root in get_all_skills_dirs():
+            skills_root = Path(skills_root).resolve()
+            for skill_path in iter_skill_index_files(skills_root, "SKILL.md"):
+                try:
+                    raw = skill_path.read_bytes()
+                    content = raw[:_PROFILE_SKILL_METADATA_READ_CHARS].decode(
+                        "utf-8-sig", errors="replace"
+                    )
+                    frontmatter, _ = parse_frontmatter(content)
+                    metadata = _profile_skill_metadata(
+                        skill_path, skills_root, frontmatter
+                    )
+                    target_fields = _profile_skill_target_fields(
+                        skill_path, skills_root, raw, project=False
+                    )
+                except (OSError, UnicodeError, ValueError):
+                    continue
+                if metadata is None or metadata["name"] in disabled:
+                    continue
+                identity = (
+                    target_fields.get("owner_id")
+                    or target_fields.get("item_id", ""),
+                    target_fields.get("skill_id")
+                    or skill_path.resolve().relative_to(skills_root).as_posix(),
+                )
+                if identity in seen_identities:
+                    continue
+                seen_identities.add(identity)
+                metadata.update(target_fields)
+                items.append(metadata)
+        items.sort(key=lambda item: (item["category"] or "", item["name"]))
+    finally:
+        reset_hermes_home_override(token)
+
+    truncated = len(items) > _PROFILE_SKILLS_MAX_ITEMS
+    bounded: list[dict] = []
+    for item in items[:_PROFILE_SKILLS_MAX_ITEMS]:
+        candidate = {"items": [*bounded, item], "truncated": False}
+        serialized = json.dumps(candidate, ensure_ascii=False, separators=(",", ":"))
+        if len(serialized.encode("utf-8")) > _PROFILE_SKILLS_MAX_SERIALIZED_UTF8_BYTES:
+            truncated = True
+            break
+        bounded.append(item)
+    return {"items": bounded, "truncated": truncated}
+
+
+
+def read_profile_summary(name: str) -> dict:
+    """Return the provider-free, bounded profile projection for the bridge."""
+    canon = normalize_profile_name(name)
+    validate_profile_name(canon)
+    profile_dir = get_profile_dir(canon)
+    if not profile_dir.is_dir() or (
+        canon != "default" and named_profile_is_deleted(profile_dir)
+    ):
+        raise FileNotFoundError(f"profile does not exist: {name}")
+    meta, _raw, revision = _read_profile_metadata_snapshot(profile_dir, strict=True)
+    model, _provider = _read_config_model(profile_dir, strict=True)
+    return {
+        "label": format_profile_label(canon, meta["display_name"]),
+        "description": meta["description"],
+        "model": model if isinstance(model, str) else None,
+        "revision": revision,
+        "instructions": _read_profile_instructions(profile_dir),
+        "skills": _read_profile_skills(profile_dir),
+    }
+
+
+def write_profile_description(
+    name: str, description: str, expected_revision: str
+) -> dict:
+    """CAS-update a profile description and return its new revision."""
+    if not isinstance(description, str) or "\x00" in description:
+        raise ValueError("profile description is invalid")
+    try:
+        description_bytes = description.encode("utf-8")
+    except UnicodeEncodeError as error:
+        raise ValueError("profile description is invalid") from error
+    if len(description_bytes) > _PROFILE_DESCRIPTION_MAX_UTF8_BYTES:
+        raise ValueError("profile description is too long")
+    if not isinstance(expected_revision, str) or not re.fullmatch(
+        r"[0-9a-f]{64}", expected_revision
+    ):
+        raise ValueError("profile revision is invalid")
+
+    canon = normalize_profile_name(name)
+    validate_profile_name(canon)
+    profile_dir = get_profile_dir(canon)
+    if not profile_dir.is_dir() or (
+        canon != "default" and named_profile_is_deleted(profile_dir)
+    ):
+        raise FileNotFoundError(f"profile does not exist: {name}")
+    with profile_metadata_lock(profile_dir):
+        _meta, _raw, revision = _read_profile_metadata_snapshot(
+            profile_dir, strict=True
+        )
+        if revision != expected_revision:
+            raise ProfileRevisionConflict("profile revision is stale")
+
+        _write_profile_meta_unlocked(
+            profile_dir,
+            description=description,
+            description_auto=False,
+        )
+        updated, _updated_raw, updated_revision = _read_profile_metadata_snapshot(
+            profile_dir, strict=True
+        )
+    return {
+        "description": updated["description"],
+        "revision": updated_revision,
+    }
+
+
+def _write_profile_meta_unlocked(
     profile_dir: Path,
     *,
     description: Optional[str] = None,
@@ -968,10 +1509,17 @@ def write_profile_meta(
     existing: dict = {}
     if path.is_file():
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                loaded = yaml.safe_load(f) or {}
+            loaded = yaml.safe_load(
+                _read_bounded_bytes(
+                    path,
+                    _PROFILE_METADATA_MAX_BYTES,
+                    label="profile metadata",
+                ).decode("utf-8")
+            ) or {}
             if isinstance(loaded, dict):
                 existing = loaded
+        except ValueError:
+            raise
         except Exception:
             existing = {}
     if description is not None:
@@ -987,9 +1535,44 @@ def write_profile_meta(
     # Atomic write: bare open("w") truncates before the dump, and the read
     # path above swallows parse errors as {}, so a crashed write would
     # silently drop unspecified fields on the next call (#51356, #16743).
-    from utils import atomic_yaml_write
+    from utils import IndentDumper, atomic_yaml_write
+
+    # Validate the exact bytes that ``atomic_yaml_write`` will emit before
+    # replacing the canonical file.  A valid near-limit metadata document can
+    # otherwise accept a bounded description update, replace the old bytes,
+    # and only fail on the next bounded read, leaving the profile unusable.
+    encoded = StringIO()
+    yaml.dump(
+        existing,
+        encoded,
+        Dumper=IndentDumper,
+        default_flow_style=False,
+        sort_keys=False,
+        allow_unicode=True,
+    )
+    if len(encoded.getvalue().encode("utf-8")) > _PROFILE_METADATA_MAX_BYTES:
+        raise ValueError("profile metadata is too large")
 
     atomic_yaml_write(path, existing, sort_keys=False)
+
+
+def write_profile_meta(
+    profile_dir: Path,
+    *,
+    description: Optional[str] = None,
+    description_auto: Optional[bool] = None,
+    display_name: Optional[str] = None,
+) -> None:
+    """Update profile metadata while holding the cross-process writer lock."""
+    if not profile_dir.is_dir():
+        raise FileNotFoundError(f"profile directory does not exist: {profile_dir}")
+    with profile_metadata_lock(profile_dir):
+        _write_profile_meta_unlocked(
+            profile_dir,
+            description=description,
+            description_auto=description_auto,
+            display_name=display_name,
+        )
 
 
 def format_profile_label(name: str, display_name: Optional[str]) -> str:

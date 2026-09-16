@@ -153,6 +153,12 @@ def _skills_dir() -> Path:
     external patchers, but when it has not been patched, resolve from the live
     profile-scoped HERMES_HOME on every call.
     """
+    from agent.skill_utils import get_execution_skill_read_roots
+
+    execution_roots = get_execution_skill_read_roots()
+    if execution_roots is not None:
+        return execution_roots[1]
+
     configured = Path(SKILLS_DIR)
     if configured != _SKILLS_DIR_AT_IMPORT:
         return configured
@@ -701,6 +707,7 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     """
     from agent.skill_utils import (
         get_external_skills_dirs,
+        get_execution_skill_read_roots,
         get_project_skills_dirs,
         iter_project_skill_files,
         iter_skill_index_files,
@@ -717,12 +724,17 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     # SKILLS_DIR can be stale in long-lived runtimes). Trusted project-local
     # dirs come FIRST: first-wins dedup below gives them precedence over
     # same-named local/external skills.
-    project_dirs = list(get_project_skills_dirs())
+    execution_roots = get_execution_skill_read_roots()
+    if execution_roots is None:
+        project_dirs = list(get_project_skills_dirs())
+        active_skills_dir = _skills_dir()
+        external_dirs = get_external_skills_dirs()
+    else:
+        project_dirs, active_skills_dir, external_dirs = execution_roots
     dirs_to_scan: list = list(project_dirs)
-    active_skills_dir = _skills_dir()
     if active_skills_dir.exists():
         dirs_to_scan.append(active_skills_dir)
-    dirs_to_scan.extend(get_external_skills_dirs())
+    dirs_to_scan.extend(external_dirs)
 
     signature = _skills_scan_signature(dirs_to_scan, disabled)
     now = time.monotonic()
@@ -1223,7 +1235,11 @@ def skill_view(
             if bare:
                 local_category_name = f"{namespace}/{bare}"
 
-        from agent.skill_utils import get_external_skills_dirs, get_project_skills_dirs
+        from agent.skill_utils import (
+            get_external_skills_dirs,
+            get_execution_skill_read_roots,
+            get_project_skills_dirs,
+        )
 
         # The categorized fall-through form (namespace/bare) joins onto each
         # search dir too; re-validate it since `bare` is not namespace-checked.
@@ -1242,12 +1258,17 @@ def skill_view(
         # Build list of all skill directories to search. Project dirs first —
         # they're the highest-precedence tier and the collision resolver
         # below uses this ordering.
-        project_dirs = get_project_skills_dirs()
+        execution_roots = get_execution_skill_read_roots()
+        if execution_roots is None:
+            project_dirs = get_project_skills_dirs()
+            active_skills_dir = _skills_dir()
+            external_dirs = get_external_skills_dirs()
+        else:
+            project_dirs, active_skills_dir, external_dirs = execution_roots
         all_dirs = list(project_dirs)
-        active_skills_dir = _skills_dir()
         if active_skills_dir.exists():
             all_dirs.append(active_skills_dir)
-        all_dirs.extend(get_external_skills_dirs())
+        all_dirs.extend(external_dirs)
 
         if not all_dirs:
             return json.dumps(

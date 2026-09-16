@@ -6,10 +6,14 @@ tool registration or provider resolution.
 """
 
 import ast
+import contextvars
+from contextlib import contextmanager
 import logging
 import os
 import re
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 
@@ -393,6 +397,13 @@ def skill_matches_environment(frontmatter: Dict[str, Any]) -> bool:
 
 _RAW_CONFIG_CACHE: Dict[Tuple[str, int, int], Dict[str, Any]] = {}
 
+# One-shot native execution snapshots are read-only.  Canonical skill write
+# paths continue to use get_all_skills_dirs()/live profile roots; only the
+# read consumers below consult this context.
+_EXECUTION_SKILL_SNAPSHOT = contextvars.ContextVar(
+    "hermes_execution_skill_snapshot", default=None
+)
+
 
 def _raw_config_cache_clear() -> None:
     """Test hook — drop the shared raw config cache."""
@@ -406,6 +417,13 @@ def _load_raw_config() -> Dict[str, Any]:
     skill prompt/build path. A tiny local cache gives the same repeated-read
     win without pulling the heavier CLI config stack into startup.
     """
+    config_module = sys.modules.get("hermes_cli.config")
+    execution_raw = (
+        config_module.get_execution_raw_config() if config_module is not None else None
+    )
+    if execution_raw is not None:
+        return execution_raw
+
     config_path = get_config_path()
     if not config_path.exists():
         return {}
@@ -813,6 +831,189 @@ def get_scan_ordered_skills_dirs() -> List[Path]:
     dirs.append(get_skills_dir())
     dirs.extend(get_external_skills_dirs())
     return dirs
+
+
+class _ExecutionSkillReadSnapshot:
+    """Temporary filesystem roots used by native execution read paths."""
+
+    __slots__ = ("project_dirs", "local_dir", "external_dirs")
+
+    def __init__(
+        self,
+        *,
+        project_dirs: List[Path],
+        local_dir: Path,
+        external_dirs: List[Path],
+    ) -> None:
+        self.project_dirs = project_dirs
+        self.local_dir = local_dir
+        self.external_dirs = external_dirs
+
+
+def get_execution_skill_read_roots() -> Optional[Tuple[List[Path], Path, List[Path]]]:
+    """Return temporary read roots for the active native execution.
+
+    ``None`` means no execution snapshot is active and callers should use
+    their existing live resolution.  The tuple is ``(project, local,
+    external)`` in the same precedence used by the regular skill readers.
+    This helper is deliberately read-only; canonical writers keep using the
+    live ``get_all_skills_dirs()`` contract.
+    """
+    snapshot = _EXECUTION_SKILL_SNAPSHOT.get()
+    if snapshot is None:
+        return None
+    return (
+        list(snapshot.project_dirs),
+        snapshot.local_dir,
+        list(snapshot.external_dirs),
+    )
+
+
+def _validate_snapshot_tree(skill_root: Path) -> Path:
+    """Resolve one skill tree and reject broken or escaping links."""
+    skill_root = skill_root.resolve(strict=True)
+    if not skill_root.is_dir():
+        raise RuntimeError(f"skill snapshot root is not a directory: {skill_root}")
+
+    for current, directories, files in os.walk(skill_root, followlinks=False):
+        current_path = Path(current)
+        for name in (*directories, *files):
+            child = current_path / name
+            if not child.is_symlink():
+                continue
+            target = child.resolve(strict=True)
+            if not target.is_relative_to(skill_root):
+                raise RuntimeError(
+                    f"skill snapshot symlink escapes skill tree: {child} -> {target}"
+                )
+            if target.is_dir() and current_path.is_relative_to(target):
+                raise RuntimeError(f"skill snapshot symlink cycle: {child} -> {target}")
+    return skill_root
+
+
+def _copy_snapshot_skill(
+    source_root: Path, skill_file: Path, destination_root: Path
+) -> None:
+    """Copy one discovered skill tree while preserving its logical path."""
+    logical_skill_dir = skill_file.parent
+    relative = logical_skill_dir.relative_to(source_root)
+    resolved_skill_dir = _validate_snapshot_tree(logical_skill_dir)
+    destination = destination_root / relative
+    if destination.exists():
+        return
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copytree(resolved_skill_dir, destination, symlinks=False)
+
+
+def _copy_snapshot_file(source_root: Path, source_file: Path, destination_root: Path) -> None:
+    """Copy a non-skill read-side file into its logical root location."""
+    relative = source_file.relative_to(source_root)
+    resolved = source_file.resolve(strict=True)
+    if not resolved.is_file():
+        raise RuntimeError(f"skill snapshot entry is not a file: {source_file}")
+    if not resolved.is_relative_to(source_root.resolve(strict=True)):
+        raise RuntimeError(
+            f"skill snapshot file escapes root: {source_file} -> {resolved}"
+        )
+    destination = destination_root / relative
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(resolved, destination)
+
+
+def _materialize_skill_root(
+    source_root: Path, destination_root: Path, *, project: bool
+) -> None:
+    """Copy active skill trees and the files their read paths explicitly use."""
+    if not source_root.exists():
+        destination_root.mkdir(parents=True)
+        return
+    destination_root.mkdir(parents=True)
+    skill_files = (
+        iter_project_skill_files(source_root)
+        if project
+        else iter_skill_index_files(source_root, "SKILL.md")
+    )
+    copied_skill_dirs: Set[Path] = set()
+    for skill_file in skill_files:
+        logical_skill_dir = skill_file.parent
+        if logical_skill_dir in copied_skill_dirs:
+            continue
+        _copy_snapshot_skill(source_root, skill_file, destination_root)
+        copied_skill_dirs.add(logical_skill_dir)
+
+    # Prompt construction reads category descriptions, and skill_view retains
+    # support for legacy flat ``<name>.md`` entries.  Copy only those explicit
+    # markdown read paths; skill support bytes are copied with each skill tree.
+    for description in iter_skill_index_files(source_root, "DESCRIPTION.md"):
+        _copy_snapshot_file(source_root, description, destination_root)
+    for markdown in source_root.rglob("*.md"):
+        if markdown.name in {"SKILL.md", "DESCRIPTION.md"} or is_skill_support_path(
+            markdown, root=source_root
+        ):
+            continue
+        _copy_snapshot_file(source_root, markdown, destination_root)
+
+    # Org provenance is read while listing and loading active org skills.
+    marker = source_root / ORG_MIRROR_DIR_NAME / ORG_ACTIVE_MARKER
+    if marker.is_file():
+        _copy_snapshot_file(source_root, marker, destination_root)
+        active_org = marker.read_text(encoding="utf-8").strip()
+        if active_org:
+            provenance = (
+                source_root
+                / ORG_MIRROR_DIR_NAME
+                / active_org
+                / ORG_PROVENANCE_FILE
+            )
+            if provenance.is_file():
+                _copy_snapshot_file(source_root, provenance, destination_root)
+
+
+@contextmanager
+def execution_skill_snapshot():
+    """Eagerly snapshot skill read roots for one native execution.
+
+    The canonical profile/project/external trees remain the source of truth
+    for writes.  The returned temporary roots exist only while this context is
+    active, so a new process/run naturally observes later canonical edits.
+    """
+    live_project_dirs = list(get_project_skills_dirs())
+    live_local_dir = get_skills_dir()
+    live_external_dirs = list(get_external_skills_dirs())
+    live_ordered_dirs = list(get_scan_ordered_skills_dirs())
+
+    with tempfile.TemporaryDirectory(prefix="hermes-execution-skills-") as temp_dir_name:
+        temp_dir = Path(temp_dir_name)
+        copied_by_source: Dict[Path, Path] = {}
+        project_source_dirs = {path.resolve() for path in live_project_dirs}
+        for source_dir in live_ordered_dirs:
+            source_key = source_dir.resolve()
+            destination_dir = copied_by_source.get(source_key)
+            if destination_dir is None:
+                destination_dir = temp_dir / f"root-{len(copied_by_source)}"
+                copied_by_source[source_key] = destination_dir
+                _materialize_skill_root(
+                    source_key,
+                    destination_dir,
+                    project=source_key in project_source_dirs,
+                )
+
+        def _mapped(source: Path) -> Path:
+            return copied_by_source[source.resolve()]
+
+        project_dirs = [_mapped(path) for path in live_project_dirs]
+        local_dir = _mapped(live_local_dir)
+        external_dirs = [_mapped(path) for path in live_external_dirs]
+        snapshot = _ExecutionSkillReadSnapshot(
+            project_dirs=project_dirs,
+            local_dir=local_dir,
+            external_dirs=external_dirs,
+        )
+        token = _EXECUTION_SKILL_SNAPSHOT.set(snapshot)
+        try:
+            yield snapshot
+        finally:
+            _EXECUTION_SKILL_SNAPSHOT.reset(token)
 
 
 # ── Project skill quarantine (scan-time injection defense) ────────────────

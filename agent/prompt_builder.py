@@ -32,6 +32,7 @@ from agent.skill_utils import (
     extract_skill_conditions,
     extract_skill_description,
     get_all_skills_dirs,
+    get_execution_skill_read_roots,
     get_disabled_skill_names,
     iter_skill_index_files,
     org_id_of_path,
@@ -1785,13 +1786,19 @@ def build_skills_system_prompt(
         skills_dir = get_skills_dir()
         _home_token = None
     try:
-        external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
+        execution_roots = get_execution_skill_read_roots()
+        if execution_roots is None:
+            external_dirs = get_all_skills_dirs()[1:]  # skip local (index 0)
+        else:
+            project_dirs, skills_dir, external_dirs = execution_roots
         # Trusted project-local dirs (./.hermes/skills, ./.agents/skills at
         # the git root) — highest-precedence tier, scanned before local.
         # Resolved once here; cwd and trust are stable for the session, so
         # the index (and the system prompt) stays byte-stable.
-        from agent.skill_utils import get_project_skills_dirs
-        project_dirs = get_project_skills_dirs()
+        if execution_roots is None:
+            from agent.skill_utils import get_project_skills_dirs
+
+            project_dirs = get_project_skills_dirs()
 
         if not skills_dir.exists() and not external_dirs and not project_dirs:
             return ""

@@ -384,6 +384,16 @@ def build_top_level_parser():
         ),
     )
     chat_parser.add_argument(
+        "--no-tools",
+        dest="no_tools",
+        action="store_true",
+        default=False,
+        help=(
+            "Disable every model tool for this chat run, including MCP and "
+            "plugin-provided tools. Cannot be combined with --toolsets."
+        ),
+    )
+    chat_parser.add_argument(
         "--image", help="Optional local image path to attach to a single query"
     )
     # `default=argparse.SUPPRESS` on flags that are ALSO declared on the
@@ -426,6 +436,14 @@ def build_top_level_parser():
         action="append",
         default=argparse.SUPPRESS,
         help="Preload one or more skills for the session (repeat flag or comma-separate)",
+    )
+    _inherited_flag(
+        chat_parser,
+        "--session-receipt-file",
+        dest="session_receipt_file",
+        metavar="PATH",
+        default=argparse.SUPPRESS,
+        help="Write the session identity receipt to PATH before starting the run",
     )
     _inherited_flag(
         chat_parser,

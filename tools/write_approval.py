@@ -42,6 +42,7 @@ web dashboard.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -439,6 +440,56 @@ def skill_pending_diff(record: Dict[str, Any]) -> str:
     action = payload.get("action", "")
     name = payload.get("name", "")
 
+    # Target-bound writes must use the same canonical target as replay.  Never
+    # fall back to the display name here: a local skill can share a
+    # frontmatter name with an external target and would produce a misleading
+    # approval diff.  A partially malformed target record is also kept on this
+    # path so it cannot silently become a legacy name lookup.
+    target_fields = ("owner_id", "skill_id", "expected_revision")
+    target_bound = any(field in payload for field in target_fields)
+    target = None
+    target_current = None
+    if target_bound:
+        try:
+            from tools.skill_manager_tool import _skills_dir
+            from tools.skill_targets import (
+                _resolve_bound_skill_target,
+                _skill_mutation_lock,
+            )
+
+            target, target_error = _resolve_bound_skill_target(
+                payload.get("owner_id"),
+                payload.get("skill_id"),
+                payload.get("expected_revision"),
+                local_skills_dir=_skills_dir(),
+            )
+        except Exception:
+            return "(target unavailable for review: target resolution failed)"
+        if target_error:
+            return f"(target unavailable for review: {target_error})"
+        if (
+            action not in {"edit", "patch"}
+            or not isinstance(payload.get("content"), str)
+            or not payload["content"]
+            or any(
+                payload.get(field) is not None
+                for field in ("old_string", "new_string", "file_path", "file_content")
+            )
+        ):
+            return f"(target-bound pending action is unsupported for review: {action})"
+        try:
+            with _skill_mutation_lock(target["skill_dir"]):
+                raw_current = target["skill_md"].read_bytes()
+                current_revision = hashlib.sha256(raw_current).hexdigest()
+                if current_revision != target["expected_revision"]:
+                    return (
+                        "(target stale for review: expected revision "
+                        f"{target['expected_revision']}, current revision {current_revision})"
+                    )
+                target_current = raw_current.decode("utf-8")
+        except (OSError, UnicodeError):
+            return "(target unavailable for review: SKILL.md is unavailable)"
+
     if action == "create":
         return (payload.get("content") or "")
 
@@ -450,7 +501,12 @@ def skill_pending_diff(record: Dict[str, Any]) -> str:
 
     current = ""
     target_label = "SKILL.md"
-    if _find_skill is not None:
+    if target_bound:
+        current = target_current or ""
+        target_label = target["skill_id"]
+        if target_label != "SKILL.md" and not target_label.endswith("/SKILL.md"):
+            target_label = f"{target_label}/SKILL.md"
+    elif _find_skill is not None:
         found = _find_skill(name)
         if found:
             base = found["path"]
@@ -471,9 +527,12 @@ def skill_pending_diff(record: Dict[str, Any]) -> str:
     if action == "edit":
         new = payload.get("content") or ""
     elif action == "patch":
-        old_s = payload.get("old_string") or ""
-        new_s = payload.get("new_string") or ""
-        new = current.replace(old_s, new_s) if current else f"(patch {old_s!r} → {new_s!r})"
+        if target_bound:
+            new = payload.get("content") or ""
+        else:
+            old_s = payload.get("old_string") or ""
+            new_s = payload.get("new_string") or ""
+            new = current.replace(old_s, new_s) if current else f"(patch {old_s!r} → {new_s!r})"
     elif action == "write_file":
         new = payload.get("file_content") or ""
     elif action == "remove_file":

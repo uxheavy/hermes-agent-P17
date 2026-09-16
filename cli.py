@@ -555,10 +555,25 @@ def load_cli_config() -> Dict[str, Any]:
     # Load from file if exists
     if config_path.exists():
         try:
-            with open(config_path, "r", encoding="utf-8") as f:
-                from hermes_cli.config import _normalize_root_model_keys
+            from hermes_cli.config import (
+                _normalize_root_model_keys,
+                get_execution_raw_config,
+            )
 
-                file_config = _normalize_root_model_keys(fast_safe_load(f) or {})
+            # A native one-shot execution snapshots the user config before
+            # importing this module. Reuse that raw user file here so the
+            # existing normalization and merge below see the same bytes as
+            # the rest of the execution. Project fallback remains live.
+            execution_raw = (
+                get_execution_raw_config()
+                if config_path == user_config_path and not ignore_user_config
+                else None
+            )
+            if execution_raw is not None:
+                file_config = _normalize_root_model_keys(execution_raw or {})
+            else:
+                with open(config_path, "r", encoding="utf-8") as f:
+                    file_config = _normalize_root_model_keys(fast_safe_load(f) or {})
             
             _file_has_terminal_config = "terminal" in file_config
 
@@ -5063,6 +5078,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         self,
         model: str = None,
         toolsets: List[str] = None,
+        no_tools: bool = False,
         provider: str = None,
         reasoning: str = None,
         api_key: str = None,
@@ -5082,6 +5098,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         Args:
             model: Model to use (default: from env or claude-sonnet)
             toolsets: List of toolsets to enable (default: all)
+            no_tools: Disable every model tool for this session
             provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
             reasoning: Reasoning effort override for this run (none|minimal|low|medium|high|xhigh|max|ultra). Wins over config.
             api_key: API key (default: from environment)
@@ -5345,18 +5362,26 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         else:
             self.run_budget_seconds = CLI_CONFIG["agent"].get("run_budget_seconds")
 
-        # Parse and validate toolsets
-        self.enabled_toolsets = toolsets
+        # Parse and validate toolsets. The explicit no-tools mode owns an
+        # empty allowlist so profile/config defaults cannot re-enable tools.
+        if no_tools and toolsets not in (None, []):
+            raise ValueError("--no-tools cannot be combined with --toolsets")
+        self.no_tools = bool(no_tools)
+        self.enabled_toolsets = [] if self.no_tools else toolsets
         from agent.skill_utils import parse_config_string_list
 
         self.disabled_toolsets = parse_config_string_list(CLI_CONFIG["agent"].get("disabled_toolsets"))
 
-        if toolsets and "all" not in toolsets and "*" not in toolsets:
+        if self.enabled_toolsets and "all" not in self.enabled_toolsets and "*" not in self.enabled_toolsets:
             # Validate each toolset — MCP server names are resolved via
             # live registry aliases (registered during discover_mcp_tools),
             # but discovery hasn't run yet at this point, so exclude them.
             mcp_names = set((CLI_CONFIG.get("mcp_servers") or {}).keys())
-            invalid = [t for t in toolsets if not validate_toolset(t) and t not in mcp_names]
+            invalid = [
+                t
+                for t in self.enabled_toolsets
+                if not validate_toolset(t) and t not in mcp_names
+            ]
             if invalid:
                 self._console_print(f"[bold red]Warning: Unknown toolsets: {', '.join(invalid)}[/]")
         
@@ -21476,13 +21501,55 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     )
 
 
+def _write_session_receipt(path: str, session_id: str) -> None:
+    """Publish the current CLI session identity through an atomic 0600 file."""
+    target = Path(path)
+    fd: int | None = None
+    temp_path: str | None = None
+    try:
+        fd, temp_path = tempfile.mkstemp(
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+            dir=str(target.parent),
+        )
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        else:
+            os.chmod(temp_path, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = None
+            json.dump(
+                {"version": 1, "session_id": session_id, "pid": os.getpid()},
+                handle,
+                separators=(",", ":"),
+            )
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, target)
+        temp_path = None
+    except BaseException:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        if temp_path is not None:
+            try:
+                os.unlink(temp_path)
+            except OSError:
+                pass
+        raise
+
+
 def main(
     query: str = None,
     q: str = None,
     oneshot: bool = False,
     image: str = None,
     toolsets: str = None,
+    no_tools: bool = False,
     skills: str | list[str] | tuple[str, ...] = None,
+    session_receipt_file: str = None,
     model: str = None,
     provider: str = None,
     reasoning: str = None,
@@ -21516,7 +21583,9 @@ def main(
             even on a TTY.
         image: Optional local image path to attach to a single query
         toolsets: Comma-separated list of toolsets to enable (e.g., "web,terminal")
+        no_tools: Disable every model tool for this invocation
         skills: Comma-separated or repeated list of skills to preload for the session
+        session_receipt_file: Optional path for the atomic session identity receipt
         model: Model to use (default: anthropic/claude-opus-4-20250514)
         provider: Inference provider ("auto", "openrouter", "nous", "openai-codex", "zai", "kimi-coding", "minimax", "minimax-cn")
         reasoning: Reasoning effort for this run (none|minimal|low|medium|high|xhigh|max|ultra). Overrides agent.reasoning_effort.
@@ -21648,10 +21717,15 @@ def main(
     # Handle query shorthand
     query = query or q
     
-    # Parse toolsets - handle both string and tuple/list inputs
-    # Default to hermes-cli toolset which includes cronjob management tools
-    toolsets_list = None
-    if toolsets:
+    # Parse toolsets - handle both string and tuple/list inputs. An explicit
+    # no-tools request must remain an empty allowlist instead of falling back
+    # to coding/platform defaults.
+    if no_tools and toolsets is not None:
+        raise ValueError("--no-tools cannot be combined with --toolsets")
+    toolsets_list = [] if no_tools else None
+    if no_tools:
+        pass
+    elif toolsets:
         if isinstance(toolsets, str):
             toolsets_list = [t.strip() for t in toolsets.split(",")]
         elif isinstance(toolsets, (list, tuple)):
@@ -21685,6 +21759,7 @@ def main(
     cli = HermesCLI(
         model=model,
         toolsets=toolsets_list,
+        no_tools=no_tools,
         provider=provider,
         reasoning=reasoning,
         api_key=api_key,
@@ -21698,6 +21773,9 @@ def main(
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
     )
+
+    if session_receipt_file:
+        _write_session_receipt(session_receipt_file, cli.session_id)
 
     if parsed_skills:
         # Load the skill payloads in the background: skill_view walks the

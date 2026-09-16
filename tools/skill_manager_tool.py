@@ -38,6 +38,7 @@ import re
 import shutil
 import threading
 import contextvars as _ctxvars
+from functools import wraps
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -49,6 +50,15 @@ from agent.skill_utils import (
     is_skill_description_truncated_for_prompt,
     parse_frontmatter as _parse_frontmatter,
     SKILL_PROMPT_DESC_LIMIT,
+)
+
+from tools.skill_targets import (
+    _resolve_bound_skill_target,
+    _skill_mutation_lock,
+    _skill_revision,
+    _skill_root_owner_id,
+    _stale_skill_result,
+    _target_fields_supplied,
 )
 
 logger = logging.getLogger(__name__)
@@ -193,6 +203,25 @@ def _skills_dir() -> Path:
 
 MAX_NAME_LENGTH = 64
 MAX_DESCRIPTION_LENGTH = 1024
+
+
+def _locked_skill_mutation(func):
+    """Serialize legacy name-resolved writes through the shared target lock."""
+    @wraps(func)
+    def wrapped(*args, **kwargs):
+        target = kwargs.get("target")
+        if target is not None:
+            skill_dir = Path(target["skill_dir"])
+        else:
+            name = args[0] if args else kwargs.get("name", "")
+            existing = _find_skill(name) if name else None
+            if existing is None:
+                return func(*args, **kwargs)
+            skill_dir = Path(existing["path"]).resolve()
+        with _skill_mutation_lock(skill_dir):
+            return func(*args, **kwargs)
+
+    return wrapped
 
 
 def _containing_skills_root(skill_path: Path) -> Path:
@@ -1037,7 +1066,8 @@ def _attach_lint_findings(result: Dict[str, Any], skill_md: Path) -> None:
     )
 
 
-def _edit_skill(name: str, content: str) -> Dict[str, Any]:
+@_locked_skill_mutation
+def _edit_skill(name: str, content: str, target: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     """Replace the SKILL.md of any existing skill (full rewrite)."""
     err = _validate_frontmatter(content)
     if err:
@@ -1047,29 +1077,52 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     if err:
         return {"success": False, "error": err}
 
-    existing = _find_skill(name)
-    if not existing:
-        return {"success": False, "error": _skill_not_found_error(name)}
-    org_guard = _org_mirror_write_guard(name, existing["path"], "edit")
+    if target is not None:
+        skill_dir = target["skill_dir"]
+        skill_md = target["skill_md"]
+        existing = {"path": skill_dir}
+        expected_revision = target["expected_revision"]
+    else:
+        existing = _find_skill(name)
+        if not existing:
+            return {"success": False, "error": _skill_not_found_error(name)}
+        skill_dir = existing["path"]
+        skill_md = skill_dir / "SKILL.md"
+        expected_revision = None
+    org_guard = _org_mirror_write_guard(name, skill_dir, "edit")
     if org_guard:
         return org_guard
-    guard = _background_review_write_guard(name, existing["path"], "edit")
+    guard = _background_review_write_guard(name, skill_dir, "edit")
     if guard:
         return guard
 
-    skill_md = existing["path"] / "SKILL.md"
     read_guard = _background_review_read_before_write_guard(
         name, skill_md, "edit", "SKILL.md"
     )
     if read_guard:
         return read_guard
 
-    # Back up original content for rollback
+    if not skill_md.is_file():
+        return {"success": False, "error": f"File not found: {skill_md}"}
+
+    # Back up original content for rollback. Target-bound writes compare the
+    # SHA256 while this mutation lock is held, so a native writer cannot race
+    # the read/check/write/rollback sequence.
     original_content = skill_md.read_text(encoding="utf-8") if skill_md.exists() else None
+    if expected_revision is not None:
+        actual_revision = _skill_revision(skill_md)
+        if actual_revision != expected_revision:
+            return _stale_skill_result(
+                skill_md,
+                expected_revision,
+                actual_revision,
+                target.get("owner_id") if target is not None else None,
+                target.get("skill_id") if target is not None else None,
+            )
     atomic_write_text(skill_md, content, preserve_mode=True, create_mode=0o644)
 
     # Security scan — roll back on block
-    scan_error = _security_scan_skill(existing["path"])
+    scan_error = _security_scan_skill(skill_dir)
     if scan_error:
         if original_content is not None:
             atomic_write_text(skill_md, original_content, preserve_mode=True)
@@ -1087,11 +1140,18 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
 
     result = {
         "success": True,
-        "message": f"Skill '{name}' updated (full rewrite).",
-        "path": str(existing["path"]),
+        "message": f"Skill '{name or skill_dir.name}' updated (full rewrite).",
+        "path": str(skill_dir),
         "_change": {"description": _desc},
     }
-    org_note = _maybe_auto_propose_org_edit(name, existing["path"])
+    if target is not None:
+        result.update(
+            owner_id=target["owner_id"],
+            skill_id=target["skill_id"],
+            revision=_skill_revision(skill_md),
+        )
+        result.pop("path", None)
+    org_note = _maybe_auto_propose_org_edit(name or skill_dir.name, skill_dir)
     if org_note:
         result["org_sharing"] = org_note
         result["message"] = f"{result['message']} {org_note}"
@@ -1099,6 +1159,7 @@ def _edit_skill(name: str, content: str) -> Dict[str, Any]:
     return result
 
 
+@_locked_skill_mutation
 def _patch_skill(
     name: str,
     old_string: str,
@@ -1344,6 +1405,7 @@ def _delete_skill(name: str, absorbed_into: Optional[str] = None) -> Dict[str, A
     }
 
 
+@_locked_skill_mutation
 def _write_file(name: str, file_path: str, file_content: str) -> Dict[str, Any]:
     """Add or overwrite a supporting file within any skill directory."""
     err = _validate_file_path(file_path)
@@ -1536,6 +1598,9 @@ def apply_skill_pending(payload: Dict[str, Any]) -> str:
             replace_all=payload.get("replace_all", False),
             absorbed_into=payload.get("absorbed_into"),
             operations=payload.get("operations"),
+            owner_id=payload.get("owner_id"),
+            skill_id=payload.get("skill_id"),
+            expected_revision=payload.get("expected_revision"),
         )
     finally:
         _skill_gate_bypass.reset(token)
@@ -1862,7 +1927,7 @@ def _maybe_debounced_sync_push(skill_name: str) -> None:
 
 def skill_manage(
     action: str,
-    name: str,
+    name: str = "",
     content: str = None,
     category: str = None,
     file_path: str = None,
@@ -1874,6 +1939,9 @@ def skill_manage(
     task_id: str = None,
     session_id: str = None,
     operations=None,
+    owner_id: str = None,
+    skill_id: str = None,
+    expected_revision: str = None,
 ) -> str:
     """
     Manage user-created skills. Dispatches to the appropriate action handler.
@@ -1885,11 +1953,73 @@ def skill_manage(
     Returns JSON string with results.
     """
     if operations is not None:
+        if _target_fields_supplied(owner_id, skill_id, expected_revision) or any(
+            isinstance(op, dict)
+            and _target_fields_supplied(
+                op.get("owner_id"),
+                op.get("skill_id"),
+                op.get("expected_revision"),
+            )
+            for op in operations
+        ):
+            return tool_error(
+                "Target-bound skill_manage writes are not supported in operations[]; "
+                "submit one targeted full-content edit.",
+                success=False,
+            )
         return _skill_manage_batch(
             operations, default_name=name or None,
             task_id=task_id, session_id=session_id,
         )
-    preflight = _background_review_preflight(action, name)
+
+    target_spec = None
+    target_error = None
+    if _target_fields_supplied(owner_id, skill_id, expected_revision):
+        target_spec, target_error = _resolve_bound_skill_target(
+            owner_id,
+            skill_id,
+            expected_revision,
+            local_skills_dir=_skills_dir(),
+        )
+        if target_error:
+            return tool_error(target_error, success=False)
+        if (
+            action not in {"edit", "patch"}
+            or not content
+            or old_string is not None
+            or new_string is not None
+            or file_path is not None
+        ):
+            return tool_error(
+                "Target-bound writes support only one full-content edit via "
+                "action='patch' (or legacy action='edit').",
+                success=False,
+            )
+        # Reject stale targets before approval staging and again in the locked
+        # edit path after an approval delay.
+        with _skill_mutation_lock(target_spec["skill_dir"]):
+            try:
+                actual_revision = _skill_revision(target_spec["skill_md"])
+            except (OSError, RuntimeError):
+                actual_revision = None
+            if actual_revision != target_spec["expected_revision"]:
+                return json.dumps(
+                    _stale_skill_result(
+                        target_spec["skill_md"],
+                        target_spec["expected_revision"],
+                        actual_revision,
+                        target_spec["owner_id"],
+                        target_spec["skill_id"],
+                    ),
+                    ensure_ascii=False,
+                )
+
+    if target_spec is not None:
+        preflight = _background_review_write_guard(
+            name, target_spec["skill_dir"], action
+        )
+    else:
+        preflight = _background_review_preflight(action, name)
     if preflight is not None:
         return json.dumps(preflight, ensure_ascii=False)
 
@@ -1902,6 +2032,8 @@ def skill_manage(
         file_path=file_path, file_content=file_content,
         old_string=old_string, new_string=new_string,
         replace_all=replace_all, absorbed_into=absorbed_into,
+        owner_id=owner_id, skill_id=skill_id,
+        expected_revision=expected_revision,
     )
     if gate_result is not None:
         return gate_result
@@ -1915,8 +2047,11 @@ def skill_manage(
     _ledger_before_dir = None
     try:
         from tools import skill_ledger as _ledger
-        _pre = _find_skill(name)
-        _ledger_before_dir = _pre["path"] if _pre else None
+        _pre = _find_skill(name) if target_spec is None else None
+        _ledger_before_dir = (
+            _pre["path"] if _pre else
+            (target_spec["skill_dir"] if target_spec is not None else None)
+        )
         _ledger_before = _ledger.capture_before(_ledger_before_dir)
     except Exception:
         pass
@@ -1931,7 +2066,7 @@ def skill_manage(
         # no longer advertised in the schema — use patch with `content`).
         if not content:
             return tool_error("content is required for a full rewrite. Provide the full updated SKILL.md text.", success=False)
-        result = _edit_skill(name, content)
+        result = _edit_skill(name, content, target=target_spec)
 
     elif action == "patch":
         # Two shapes: old_string/new_string = targeted replacement;
@@ -1943,7 +2078,7 @@ def skill_manage(
                 success=False,
             )
         if content:
-            result = _edit_skill(name, content)
+            result = _edit_skill(name, content, target=target_spec)
         else:
             # Targeted-replacement validation lives in _patch_skill so the
             # public tool and the helper return the same actionable guidance.
@@ -1970,11 +2105,17 @@ def skill_manage(
         result = {"success": False, "error": f"Unknown action '{action}'. Use: create, edit, patch, delete, write_file, remove_file"}
 
     if result.get("success"):
+        lifecycle_name = (
+            target_spec["skill_dir"].name if target_spec is not None else name
+        )
         # Audit ledger append (best-effort; never blocks the mutation).
         try:
             from tools import skill_ledger as _ledger
-            _post = _find_skill(name)
-            _after_dir = _post["path"] if _post else None
+            _post = _find_skill(name) if target_spec is None else None
+            _after_dir = (
+                _post["path"] if _post else
+                (target_spec["skill_dir"] if target_spec is not None else None)
+            )
             _evidence = {}
             if action == "delete":
                 # Record delete intent: consolidation vs prune, and whether
@@ -1985,9 +2126,15 @@ def skill_manage(
                 _evidence["session_id"] = session_id
             if file_path:
                 _evidence["file_path"] = file_path
+            if target_spec is not None:
+                _evidence.update(
+                    owner_id=target_spec["owner_id"],
+                    skill_id=target_spec["skill_id"],
+                    expected_revision=target_spec["expected_revision"],
+                )
             _ledger.record_mutation(
                 action,
-                name,
+                lifecycle_name,
                 before=_ledger_before if _ledger_before is not None else [],
                 after_root=_after_dir,
                 evidence=_evidence,
@@ -2008,26 +2155,26 @@ def skill_manage(
         try:
             from tools.skill_usage import bump_patch, forget, record_created
             from tools.skill_provenance import is_background_review
-            if action == "create":
+            if target_spec is None and action == "create":
                 record_created(
-                    name,
+                    lifecycle_name,
                     agent_created=is_background_review(),
                     task_id=task_id,
                     session_id=session_id,
                 )
-            elif action in {"patch", "edit", "write_file", "remove_file"}:
+            elif target_spec is None and action in {"patch", "edit", "write_file", "remove_file"}:
                 bump_patch(
-                    name,
+                    lifecycle_name,
                     action=action,
                     task_id=task_id,
                     session_id=session_id,
                 )
-            elif action == "delete":
+            elif target_spec is None and action == "delete":
                 # A recoverable curator archive (routed through archive_skill)
                 # keeps its usage record as STATE_ARCHIVED so `hermes curator
                 # status`/`restore` still see it. Only a hard delete forgets.
                 if not result.get("_archived"):
-                    forget(name)
+                    forget(lifecycle_name)
         except Exception:
             pass
 
@@ -2038,10 +2185,11 @@ def skill_manage(
         # token), a sync base URL is configured, and the skill is opted into
         # sync. Debounced so a burst of edits collapses to one push. Never
         # raises -- an agent write must never block on sync (M1-C invariant).
-        try:
-            _maybe_debounced_sync_push(name)
-        except Exception:
-            pass
+        if target_spec is None:
+            try:
+                _maybe_debounced_sync_push(lifecycle_name)
+            except Exception:
+                pass
 
     return json.dumps(result, ensure_ascii=False)
 
@@ -2169,6 +2317,9 @@ registry.register(
         replace_all=args.get("replace_all", False),
         absorbed_into=args.get("absorbed_into"),
         operations=args.get("operations"),
+        owner_id=args.get("owner_id"),
+        skill_id=args.get("skill_id"),
+        expected_revision=args.get("expected_revision"),
         task_id=kw.get("task_id"),
         session_id=kw.get("session_id")),
     emoji="📝",

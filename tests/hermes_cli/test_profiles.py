@@ -261,6 +261,59 @@ class TestNoSkillsOptOut:
 
 
 # ===================================================================
+# TestProfileSkillProjection
+# ===================================================================
+
+class TestProfileSkillProjection:
+    """Profile summaries expose profile-owned and configured external skills."""
+
+    def test_excludes_project_skills_but_keeps_external_targets(self, profile_env, monkeypatch):
+        from agent.skill_utils import _external_dirs_cache_clear
+
+        profile_dir = profile_env / "profiles" / "worker"
+        (profile_dir / "skills" / "local-only").mkdir(parents=True)
+        (profile_dir / "skills" / "local-only" / "SKILL.md").write_text(
+            "---\nname: local-only\ndescription: Local skill.\n---\n",
+            encoding="utf-8",
+        )
+
+        external_root = profile_env / "shared-skills"
+        (external_root / "external-only").mkdir(parents=True)
+        (external_root / "external-only" / "SKILL.md").write_text(
+            "---\nname: external-only\ndescription: External skill.\n---\n",
+            encoding="utf-8",
+        )
+
+        project_root = profile_env / "project"
+        (project_root / ".git").mkdir(parents=True)
+        (project_root / ".agents" / "skills" / "project-only").mkdir(parents=True)
+        (project_root / ".agents" / "skills" / "project-only" / "SKILL.md").write_text(
+            "---\nname: project-only\ndescription: Project skill.\n---\n",
+            encoding="utf-8",
+        )
+        (profile_dir / "config.yaml").write_text(
+            yaml.safe_dump(
+                {
+                    "skills": {
+                        "external_dirs": [str(external_root)],
+                        "trusted_project_dirs": [str(project_root)],
+                    }
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        monkeypatch.setenv("TERMINAL_CWD", str(project_root))
+        _external_dirs_cache_clear()
+        result = profiles._read_profile_skills(profile_dir)
+
+        items = {item["name"]: item for item in result["items"]}
+        assert set(items) == {"local-only", "external-only"}
+        assert items["local-only"]["editable"] is False
+        assert items["external-only"]["editable"] is True
+
+
+# ===================================================================
 # TestBackfillProfileEnvs
 # ===================================================================
 
@@ -1175,5 +1228,4 @@ class TestResolveProfileEnvSpelling:
         # No HERMES_HOME: the platform default root applies (existing contract).
         monkeypatch.delenv("HERMES_HOME", raising=False)
         assert Path(resolve_profile_env("default")) == _get_default_hermes_home()
-
 

@@ -353,19 +353,21 @@ class CLIAgentSetupMixin:
         # self.system_prompt below. No-op when nothing was requested.
         self.finalize_preloaded_skills()
 
-        _prepare_deferred_agent_startup()
+        if not self.no_tools:
+            _prepare_deferred_agent_startup()
         self._install_tool_callbacks()
         self._ensure_tirith_security()
 
         if not self._ensure_runtime_credentials():
             return False
 
-        from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
+        if not self.no_tools:
+            from hermes_cli.mcp_startup import ensure_mcp_discovery_before_agent_build
 
-        ensure_mcp_discovery_before_agent_build(
-            logger=logger,
-            single_query=getattr(self, "_single_query_mode", False),
-        )
+            ensure_mcp_discovery_before_agent_build(
+                logger=logger,
+                single_query=getattr(self, "_single_query_mode", False),
+            )
 
         # Initialize SQLite session store for CLI sessions (if not already done in __init__)
         if self._session_db is None:
@@ -531,8 +533,9 @@ class CLIAgentSetupMixin:
                 checkpoint_max_total_size_mb=self.checkpoint_max_total_size_mb,
                 checkpoint_max_file_size_mb=self.checkpoint_max_file_size_mb,
                 pass_session_id=self.pass_session_id,
-                skip_context_files=self.ignore_rules,
-                skip_memory=self.ignore_rules,
+                skip_context_files=self.ignore_rules or self.no_tools,
+                skip_memory=self.ignore_rules or self.no_tools,
+                skip_background_review=self.no_tools,
                 tool_progress_callback=self._on_tool_progress,
                 tool_start_callback=self._on_tool_start if self._inline_diffs_enabled else None,
                 tool_complete_callback=self._on_tool_complete if self._inline_diffs_enabled else None,

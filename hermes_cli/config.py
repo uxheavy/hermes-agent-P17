@@ -15,6 +15,8 @@ This module provides:
 """
 
 import copy
+import contextvars
+from contextlib import contextmanager
 from decimal import Decimal, InvalidOperation
 from hermes_cli.cli_output import line_input
 import json
@@ -43,6 +45,14 @@ logger = logging.getLogger(__name__)
 # so concurrent CLI/gateway loads of a broken config.yaml don't spam stderr
 # every time. Cleared automatically when the file changes (different mtime).
 _CONFIG_PARSE_WARNED: set = set()
+
+# A one-shot execution must keep reading the configuration that was present
+# when the agent was built.  The ordinary caches below intentionally notice
+# edits during a long-lived session; this context is the narrow read-only
+# override used by native one-shot execution and is never persisted.
+_EXECUTION_CONFIG_SNAPSHOT = contextvars.ContextVar(
+    "hermes_execution_config_snapshot", default=None
+)
 
 
 def _backup_corrupt_config(config_path: Path) -> Optional[Path]:
@@ -3324,6 +3334,38 @@ def resolve_ephemeral_system_prompt_from_config(cfg: Optional[Dict[str, Any]]) -
     return resolve_ephemeral_system_prompt(cfg)
 
 
+@contextmanager
+def execution_config_snapshot():
+    """Freeze behavioral config reads for one native execution.
+
+    The normal config caches intentionally invalidate when a user edits
+    ``config.yaml``.  A running one-shot agent needs the opposite guarantee:
+    every later behavioral read sees the same starting values.  This context
+    only overrides the read APIs below; config writes, ``.env``/credential
+    resolution, and the canonical profile files remain live.
+
+    Loading before setting the context keeps nested scopes deterministic and
+    avoids recursively reading the frozen value.
+    """
+    config = load_config()
+    raw_config = read_raw_config()
+    snapshot = (copy.deepcopy(config), copy.deepcopy(raw_config))
+    token = _EXECUTION_CONFIG_SNAPSHOT.set(snapshot)
+    try:
+        yield snapshot
+    finally:
+        _EXECUTION_CONFIG_SNAPSHOT.reset(token)
+
+
+def get_execution_raw_config(*, readonly: bool = False) -> Optional[Dict[str, Any]]:
+    """Return the active execution's raw config, or ``None`` when inactive."""
+    snapshot = _EXECUTION_CONFIG_SNAPSHOT.get()
+    if snapshot is None:
+        return None
+    raw = snapshot[1]
+    return raw if readonly else copy.deepcopy(raw)
+
+
 def read_raw_config() -> Dict[str, Any]:
     """Read ~/.hermes/config.yaml as-is, without merging defaults or migrating.
 
@@ -3336,6 +3378,10 @@ def read_raw_config() -> Dict[str, Any]:
     ``load_config()``. Returns a deepcopy on every call since some callers
     mutate the result before passing to ``save_config()``.
     """
+    execution_raw = get_execution_raw_config()
+    if execution_raw is not None:
+        return execution_raw
+
     with _CONFIG_LOCK:
         try:
             config_path = get_config_path()
@@ -3426,6 +3472,10 @@ def read_raw_config_readonly() -> Dict[str, Any]:
     Same (mtime_ns, size) freshness key as ``read_raw_config()`` — an edited
     config.yaml is picked up on the next call.
     """
+    execution_raw = get_execution_raw_config(readonly=True)
+    if execution_raw is not None:
+        return execution_raw
+
     with _CONFIG_LOCK:
         try:
             config_path = get_config_path()
@@ -3581,6 +3631,9 @@ def load_config() -> Dict[str, Any]:
     defensive deepcopy — that path matters in agent-loop hot spots like
     ``get_provider_request_timeout`` which is called once per API turn.
     """
+    snapshot = _EXECUTION_CONFIG_SNAPSHOT.get()
+    if snapshot is not None:
+        return copy.deepcopy(snapshot[0])
     return _load_config_impl(want_deepcopy=True)
 
 
@@ -3604,6 +3657,9 @@ def load_config_readonly() -> Dict[str, Any]:
     existing ``isinstance(x, dict)`` guards downstream keep working. The
     safety guarantee is purely documented, not enforced — be careful.
     """
+    snapshot = _EXECUTION_CONFIG_SNAPSHOT.get()
+    if snapshot is not None:
+        return snapshot[0]
     return _load_config_impl(want_deepcopy=False)
 
 
