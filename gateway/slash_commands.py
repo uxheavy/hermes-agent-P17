@@ -1,3 +1,6 @@
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 """Gateway slash-command handlers for GatewayRunner.
 
 Extracted from ``gateway/run.py`` (god-file decomposition Phase 3b). These are
@@ -5802,6 +5805,40 @@ class GatewaySlashCommandsMixin:
         except Exception as e:
             logger.error("Insights command error: %s", e, exc_info=True)
             return t("gateway.insights.error", error=e)
+
+    async def _handle_reload_command(self, event: MessageEvent) -> str:
+        """Handle /reload — re-read SOUL.md, config.yaml and memory files.
+
+        Validates the files first (broken file -> error, nothing changes).
+        Then clears the session's stored system prompt and evicts the cached
+        agent, so the NEXT turn rebuilds both from disk.  The transcript is
+        never touched.  Costs one prompt-cache miss.  A running turn is not
+        interrupted: the command is queued behind it like other busy commands.
+
+        .env is deliberately NOT reloaded here: the gateway already re-reads
+        it every turn via ``_reload_runtime_env_preserving_config_authority``
+        (multiplex-safe).  ``hermes_cli.config.reload_env`` would also delete
+        known Hermes vars that live only in the process environment (e.g. a
+        launchd-provided allowlist or token), locking users out.
+        """
+        from agent.prompt_builder import clear_skills_system_prompt_cache
+        from agent.profile_reload import check_profile_files, format_reload_report
+        from hermes_constants import get_hermes_home
+
+        check = check_profile_files(get_hermes_home())
+        if not check.ok:
+            return f"❌ Reload failed, keeping previous settings: {check.error}"
+        try:
+            session_entry = await self.async_session_store.get_or_create_session(event.source)
+            session_key = self._session_key_for_source(event.source)
+            clear_skills_system_prompt_cache(clear_snapshot=True)
+            if self._session_db:
+                await self._session_db.update_system_prompt(session_entry.session_id, None)
+            self._evict_cached_agent(session_key)
+            return format_reload_report(check)
+        except Exception as exc:
+            logger.warning("Profile reload failed: %s", exc)
+            return f"❌ Reload failed: {exc}"
 
     async def _handle_reload_mcp_command(self, event: MessageEvent) -> Optional[str]:
         """Handle /reload-mcp — reconnect MCP servers and rebuild the cached agent.

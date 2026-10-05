@@ -1,3 +1,6 @@
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 """
 Gateway runner - entry point for messaging platform integrations.
 
@@ -18602,6 +18605,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if canonical == "insights":
             return await self._handle_insights_command(event)
+
+        if canonical == "reload":
+            return await self._handle_reload_command(event)
 
         if canonical == "reload-mcp":
             return await self._handle_reload_mcp_command(event)

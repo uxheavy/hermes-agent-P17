@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 """
 Hermes Agent CLI - Interactive Terminal Interface
 
@@ -12743,9 +12746,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         elif canonical == "image":
             self._handle_image_command(cmd_original)
         elif canonical == "reload":
-            from hermes_cli.config import reload_env
-            count = reload_env()
-            print(f"  Reloaded .env ({count} var(s) updated)")
+            self._reload_profile()
         elif canonical == "reload-mcp":
             # Interactive reload: confirm first (unless the user has opted out).
             # The auto-reload path (file watcher) calls _reload_mcp directly
@@ -14580,6 +14581,33 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
 
         with self._busy_command(self._slow_command_status(cmd_original)):
             self._reload_mcp()
+
+    def _reload_profile(self) -> None:
+        """/reload: re-read .env plus SOUL.md, config.yaml and memory files.
+
+        Validates first; a broken file keeps the current session untouched.
+        History is kept; the next turn rebuilds the system prompt from disk.
+        """
+        from agent.profile_reload import (
+            check_profile_files, format_reload_report, invalidate_session_prompt,
+        )
+        from hermes_cli.config import reload_env
+        from hermes_constants import get_hermes_home
+
+        check = check_profile_files(get_hermes_home())
+        if not check.ok:
+            print(f"  ❌ Reload failed, keeping previous settings: {check.error}")
+            return
+        env_count = reload_env()
+        try:
+            invalidate_session_prompt(self.agent, self._session_db, self.session_id)
+        except Exception as e:
+            print(f"  ❌ Reload failed, keeping previous settings: {e}")
+            return
+        # Drop the live agent so it is rebuilt from the fresh config on the
+        # next turn; conversation_history stays on the CLI object.
+        self.agent = None
+        print(f"  {format_reload_report(check)} .env: {env_count} var(s) updated.")
 
     def _reload_mcp(self):
         """Reload MCP servers: disconnect all, re-read config.yaml, reconnect.
