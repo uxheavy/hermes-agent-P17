@@ -5804,17 +5804,22 @@ class GatewaySlashCommandsMixin:
             return t("gateway.insights.error", error=e)
 
     async def _handle_reload_command(self, event: MessageEvent) -> str:
-        """Handle /reload — re-read SOUL.md, config.yaml, memory files and .env.
+        """Handle /reload — re-read SOUL.md, config.yaml and memory files.
 
         Validates the files first (broken file -> error, nothing changes).
         Then clears the session's stored system prompt and evicts the cached
         agent, so the NEXT turn rebuilds both from disk.  The transcript is
         never touched.  Costs one prompt-cache miss.  A running turn is not
         interrupted: the command is queued behind it like other busy commands.
+
+        .env is deliberately NOT reloaded here: the gateway already re-reads
+        it every turn via ``_reload_runtime_env_preserving_config_authority``
+        (multiplex-safe).  ``hermes_cli.config.reload_env`` would also delete
+        known Hermes vars that live only in the process environment (e.g. a
+        launchd-provided allowlist or token), locking users out.
         """
         from agent.prompt_builder import clear_skills_system_prompt_cache
         from agent.profile_reload import check_profile_files, format_reload_report
-        from hermes_cli.config import reload_env
         from hermes_constants import get_hermes_home
 
         check = check_profile_files(get_hermes_home())
@@ -5827,8 +5832,7 @@ class GatewaySlashCommandsMixin:
             if self._session_db:
                 await self._session_db.update_system_prompt(session_entry.session_id, None)
             self._evict_cached_agent(session_key)
-            env_count = reload_env()
-            return f"{format_reload_report(check)} .env: {env_count} var(s) updated."
+            return format_reload_report(check)
         except Exception as exc:
             logger.warning("Profile reload failed: %s", exc)
             return f"❌ Reload failed: {exc}"
