@@ -1,3 +1,6 @@
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 """Gateway slash-command handlers for GatewayRunner.
 
 Extracted from ``gateway/run.py`` (god-file decomposition Phase 3b). These are

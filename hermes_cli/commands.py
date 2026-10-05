@@ -1,3 +1,6 @@
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 """Slash command definitions and autocomplete for the Hermes CLI.
 
 Central registry for all slash commands. Every consumer -- CLI help, gateway

@@ -1,4 +1,7 @@
 #!/usr/bin/env python3
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 """
 Hermes Agent CLI - Interactive Terminal Interface
 

@@ -1,3 +1,6 @@
+# Copyright (c) 2026-present Ngo Quoc Huy
+# SPDX-License-Identifier: MIT
+
 """Live reload of a profile's on-disk files into a running conversation.
 
 ``/reload`` (CLI and gateway chats) shares this one code path.  The profile
