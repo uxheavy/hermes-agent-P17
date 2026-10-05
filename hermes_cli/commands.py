@@ -365,8 +365,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
                             "notify-list", "notify-unsubscribe", "log", "runs",
                             "heartbeat", "assignees", "context", "specify", "gc"),
                busy_policy="dispatch", desktop="advanced"),
-    CommandDef("reload", "Reload .env variables into the running session", "Tools & Skills",
-               cli_only=True, desktop="terminal"),
+    CommandDef("reload", "Reload .env, SOUL.md, config.yaml and memory files into the running session", "Tools & Skills",
+               desktop="terminal"),
     CommandDef("reload-mcp", "Reload MCP servers from config", "Tools & Skills",
                aliases=("reload_mcp",), desktop="advanced"),
     CommandDef("reload-skills", "Re-scan ~/.hermes/skills/ for newly installed or removed skills",
@@ -1478,7 +1478,11 @@ _SLACK_PRIORITY_ALIASES: tuple[str, ...] = ()
 #     (session export is an interactive surface; platform is a rare
 #     informational lookup) — without this entry /save tips the registry
 #     past the 50-cap and silently clamps /platform, breaking parity.
-_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights"})
+#   - reload: profile-file reload (SOUL.md, config.yaml, memory); an occasional
+#     edit-then-refresh action, reached via /hermes reload on Slack. Demoted
+#     when /reload became gateway-available — a native slot would clamp
+#     another command and break Telegram parity.
+_SLACK_VIA_HERMES_ONLY = frozenset({"topup", "moa", "debug", "egress", "init", "version", "diff", "update", "heartbeat", "refine", "review", "pause", "whoami", "platform", "insights", "reload"})
 
 
 def _sanitize_slack_name(raw: str) -> str:
